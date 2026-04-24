@@ -1,1 +1,5 @@
-circuits
+# Ignored Folders
+circuits/
+results/
+.vscode/
+__pycache__/
