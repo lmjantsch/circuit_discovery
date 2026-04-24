@@ -119,6 +119,23 @@ Results are stored as `.pkl` files in `MIB-circuit-track/results/` and circuits 
 
 The custom DPA implementation in `experiments/mib/run_attribution.py` uses backward passes to trace dual-path edge attributions without running the full EAP-IG pipeline. It produces score dicts consumed by `create_mib_circuite.py` to build the graph JSON independently of TransformerLens.
 
+### CircuitTracer (`tracer/`)
+
+A standalone nnsight-based circuit tracer. Entry point is `CircuitTracer.__call__(batch)` where `batch = (clean_prompt, _, clean_targets, corrupt_targets)`.
+
+| File | Purpose |
+|------|---------|
+| `tracer/tracer.py` | `CircuitTracer` — forward cache + backward scoring loop |
+| `tracer/backend.py` | `compute_rmsnorm_input_gradients`, `compute_headwise_input_gradients` — gradient backprop through RMSNorm and linear projections (with optional inverse RoPE) |
+| `tracer/modeling_utils.py` | `per_head_attn_out` — splits attention output by head via `o_proj`; `apply_inverse_rope` — undoes RoPE for k/q grad backprop |
+
+**Score matrix layout** (`circuit_scores` shape `[source_dims, grad_dims]`):
+
+- `source_dims = 1 + n_layers * (n_heads + 1)` — embedding (1) + per-layer: heads (n_heads) then MLP (1)
+- `grad_dims = n_layers * (3 * n_heads + 1) + 1` — per-layer: q/k/v heads (3×n_heads) then MLP (1), plus lm_head (1)
+
+**Assumptions**: Qwen2.5-style architecture — `model.model.embed_tokens`, `model.model.rotary_emb`, `model.model.layers[i]` with `.self_attn`, `.mlp`, `.input_layernorm`, `.post_attention_layernorm`. GQA is handled in `compute_headwise_input_gradients` via `repeat_interleave`.
+
 ## Testing
 
 The root `test.ipynb` and `importances.json` / `test_importance.json` files are used for interactive prototyping. There is no automated test suite.
