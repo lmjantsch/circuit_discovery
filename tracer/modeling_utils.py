@@ -1,5 +1,8 @@
 import torch
 
+from dataclasses import dataclass
+from typing import Callable
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -15,8 +18,3 @@ def apply_inverse_rope(grad, rot_embeds):
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
     return (grad * cos) + (rotate_half(grad) * (-sin))
-
-def per_head_attn_out(z: torch.Tensor, W_linear: torch.Tensor) -> torch.Tensor:
-    _, _, H, d = z.shape
-    W_linear = W_linear.T.reshape(H, d, -1).detach()
-    return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
