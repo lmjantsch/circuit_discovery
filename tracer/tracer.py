@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from abc import ABC
 
 import torch
 from torch.utils.data import DataLoader
@@ -24,6 +25,10 @@ class EdgeCircuitTracer:
         self.cache = {}
         self.source_2d_cache = None
         self.baseline_2d_cache = None
+        self.disable_source_caching = False
+
+        self.clean_embeds = None
+        self.corrupt_embeds = None
 
         self.curr_batch_size = None
         self.curr_seq_len = None
@@ -35,7 +40,7 @@ class EdgeCircuitTracer:
     def _init_source_cache(self) -> torch.Tensor:
         return torch.zeros(self.adapter.source_dims, self.BSD, device=self.adapter.device, dtype=self.adapter.dtype)
     
-    def build_circuit(self, dataloader: DataLoader, use_counterfactual: bool = False):
+    def build_circuit(self, dataloader: DataLoader, use_counterfactual: bool = False, integration_steps: int = 1):
         self.circuit_scores = torch.zeros(self.adapter.source_dims, self.adapter.grad_dims, dtype=self.adapter.dtype, device=self.cache_device)
         self.num_processed_samples = 0
 
@@ -47,27 +52,39 @@ class EdgeCircuitTracer:
                 corrupt_inputs = self.tokenizer(corrupt_prompts, padding=True, return_tensors='pt')
 
                 self.curr_batch_size, self.curr_seq_len = clean_inputs['input_ids'].shape
-                self.num_processed_samples += self.curr_batch_size
 
                 with self.manage_batch_context(), self.model.session():
 
-                    if use_counterfactual == True:
+                    if use_counterfactual == True or integration_steps > 1:
                         with self.model.trace(**corrupt_inputs):
                             self._forward_pass_and_cache()
+                        self.corrupt_embeds = self.cache[-1]['out'].detach().clone()
                         self.baseline_2d_cache = self.source_2d_cache
                         self.source_2d_cache = self._init_source_cache()
                         
 
                     with self.model.trace(**clean_inputs):
                         self._forward_pass_and_cache()
+                        self.clean_embeds = self.cache[-1]['out'].detach().clone()
                         metric = self._get_metric(clean_targets, corrupt_targets)
 
-                        if use_counterfactual == True:
+                        if use_counterfactual == True or integration_steps > 1:
                             self.source_2d_cache -= self.baseline_2d_cache
                             self.baseline_2d_cache = None
 
+                        self.num_processed_samples += self.curr_batch_size
                         self._backward_pass_and_scoring(metric)
 
+                    if integration_steps > 1:
+                        self.disable_source_caching = True
+                        for alpha in torch.linspace(0, 1, integration_steps)[1:]:
+                            with self.model.trace(**clean_inputs):
+                                integrated_embeds = (1- alpha) * self.clean_embeds + alpha * self.corrupt_embeds
+                                self._forward_pass_and_cache(integrated_embeds)
+                                metric = self._get_metric(clean_targets, corrupt_targets)
+                                
+                                self.num_processed_samples += self.curr_batch_size
+                                self._backward_pass_and_scoring(metric)
 
         finally:
             circuit_scores = self.circuit_scores
@@ -85,12 +102,15 @@ class EdgeCircuitTracer:
         except Exception as e:
             print(e)
         finally:
-            self.cache = {}
-            self.source_2d_cache = None
-            self.baseline_2d_cache = None # also clean up any allocated baseline cache
+            self.empty_cache()
+            self.disable_source_caching = False
  
+    def empty_cache(self):
+        self.cache = {}
+        self.source_2d_cache = None
+        self.baseline_2d_cache = None
 
-    def _forward_pass_and_cache(self):
+    def _forward_pass_and_cache(self, integrated_embeds: torch.Tensor | None = None):
 
         if self.adapter.uses_rotary_emb:
             rot_cos, rot_sin = self.adapter.rotary_emb.output
@@ -99,7 +119,9 @@ class EdgeCircuitTracer:
 
         # use first layer input to aggregate gpt2 embeddings
         first_layer = self.adapter.layers[0]
-        self.cache[-1]['out'] = self.adapter.ln_1(first_layer).input
+        if integrated_embeds is not None:
+            first_layer.input = integrated_embeds
+        self.cache[-1]['out'] = first_layer.input
         self._update_source_2d_cache(
             self.adapter.ln_1(first_layer).input.reshape(1, self.BSD), type='emb'
         )
@@ -108,12 +130,12 @@ class EdgeCircuitTracer:
         for layer_id, layer in enumerate(self.adapter.layers):
 
             self.adapter.build_attn_source(layer) # call to build source
-            self.cache[layer_id]['q_proj_out'] = self.adapter.q_proj_out(layer).output
-            self.cache[layer_id]['k_proj_out'] = self.adapter.k_proj_out(layer).output
-            self.cache[layer_id]['v_proj_out'] = self.adapter.v_proj_out(layer).output
+            self.cache[layer_id]['q_proj_out'] = self.adapter.q_proj_out(layer)
+            self.cache[layer_id]['k_proj_out'] = self.adapter.k_proj_out(layer)
+            self.cache[layer_id]['v_proj_out'] = self.adapter.v_proj_out(layer)
 
             attn_out = self.adapter.compute_per_head_attn_out(
-                self.adapter.attn_interface_out(layer).output[0].detach(), self.adapter.o_proj_weights(layer)
+                self.adapter.attn_interface(layer).output[0].detach(), self.adapter.o_proj_weights(layer)
             ).reshape(self.adapter.n_heads, self.BSD)
             self._update_source_2d_cache(attn_out, type='attn', layer_id=layer_id)
 
@@ -127,9 +149,9 @@ class EdgeCircuitTracer:
         self.cache['logits'] = self.adapter.lm_head.output
 
     def _update_source_2d_cache(self, new_tensor: torch.Tensor, type: str, layer_id: int = None):
-        source_slice = self.adapter.get_src_slice(type=type, layer_id = layer_id)
-        self.source_2d_cache[source_slice] += new_tensor.detach()
-
+        if self.disable_source_caching == False:
+            source_slice = self.adapter.get_src_slice(type=type, layer_id = layer_id)
+            self.source_2d_cache[source_slice] = new_tensor.detach()
     
     def _get_metric(self, clean_targets, corrupt_targets):
         clean_logits = self.cache['logits'][range(len(clean_targets)), -1, clean_targets]
@@ -153,7 +175,7 @@ class EdgeCircuitTracer:
                 ).reshape(1, self.BSD)
                 self._update_scores(mlp_in_grad_pre_norm, type='mlp', layer_id=layer_id)
                 del mlp_in_grad_pre_norm
-
+                
                 v_proj_in_grad_pre_norm = self.adapter.compute_headwise_value_input_gradient(
                     grad=self.cache[layer_id]['v_proj_out'].grad.detach(),
                     x_pre_norm=layer_input, layer=layer, cache=self.cache
@@ -186,3 +208,4 @@ class EdgeCircuitTracer:
         new_score_weight = self.curr_batch_size / self.num_processed_samples
         new_score_delta = (new_score_mean.to(self.cache_device).detach() - self.circuit_scores[src_slice, tgt_slice])
         self.circuit_scores[src_slice, tgt_slice] += new_score_weight * new_score_delta
+
