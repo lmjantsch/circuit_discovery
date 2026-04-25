@@ -7,21 +7,13 @@ from tracer.modeling_utils import apply_inverse_rope
 
 class ModelAdapter(ABC):
 
-    def __init__(self, model):
+    def __init__(self, model, frozen_norm: bool = True):
         self.model = model
+        self.config = model.config
         self.device = model.device
         self.dtype = model.dtype
 
-        self.n_layers = model.config.num_hidden_layers
-        self.n_heads = model.config.num_attention_heads
-        self.model_dim = model.config.hidden_size
-
-        if not hasattr(model.config, 'head_dim'):
-            self.head_dim = self.model_dim // self.n_heads
-        else:
-            self.head_dim = model.config.head_dim
-
-        self.uses_rotary_emb = False
+        self.frozen_norm = frozen_norm
 
     @property
     def source_dims(self) -> int:
@@ -30,6 +22,31 @@ class ModelAdapter(ABC):
     @property
     def grad_dims(self) -> int:
         return (self.n_layers * (3 * self.n_heads + 1) + 1)
+    
+    @property
+    @abstractmethod
+    def uses_rotary_emb(self):
+        pass
+
+    @property
+    @abstractmethod
+    def n_layers(self):
+        pass
+
+    @property
+    @abstractmethod
+    def n_heads(self):
+        pass
+
+    @property
+    @abstractmethod
+    def model_dim(self):
+        pass
+
+    @property
+    @abstractmethod
+    def head_dim(self):
+        pass
         
     def get_src_slice(self, type: str, layer_id: int | None) -> slice:
         if type == 'emb':
@@ -111,7 +128,7 @@ class ModelAdapter(ABC):
         pass
     
     @abstractmethod
-    def attn_interface_out(self, layer: nn.Module):
+    def attn_interface(self, layer: nn.Module):
         pass
 
     @abstractmethod
@@ -203,10 +220,28 @@ class ModelAdapter(ABC):
 
 class Llama2ModelAdapter(ModelAdapter):
 
-    def __init__(self, model):
-        super().__init__(model)
-        self.uses_rotary_emb = True
+    @property
+    def uses_rotary_emb(self):
+        return True
     
+    @property
+    def n_layers(self):
+        return self.config.num_hidden_layers
+
+    @property
+    def n_heads(self):
+        return self.config.num_attention_heads
+
+    @property
+    def model_dim(self):
+        return self.config.hidden_size
+
+    @property
+    def head_dim(self):
+        if not hasattr(self.config, 'head_dim'):
+            return self.model_dim // self.n_heads
+        return self.config.head_dim
+
     @property
     def embed_tokens(self) -> nn.Module:
         return self.model.model.embed_tokens
@@ -231,24 +266,24 @@ class Llama2ModelAdapter(ModelAdapter):
         layer.self_attn.source
 
     def q_proj_out(self, layer: nn.Module):
-        return layer.self_attn.q_proj
+        return layer.self_attn.q_proj.output
     
     def q_proj_weights(self, layer: nn.Module):
         return layer.self_attn.q_proj.weight.data
 
     def k_proj_out(self, layer: nn.Module):
-        return layer.self_attn.source.attention_interface_0.source.repeat_kv_0
+        return layer.self_attn.source.attention_interface_0.source.repeat_kv_0.output
     
     def k_proj_weights(self, layer: nn.Module):
         return layer.self_attn.k_proj.weight.data
 
     def v_proj_out(self, layer: nn.Module):
-        return layer.self_attn.source.attention_interface_0.source.repeat_kv_1
+        return layer.self_attn.source.attention_interface_0.source.repeat_kv_1.output
     
     def v_proj_weights(self, layer: nn.Module):
         return layer.self_attn.v_proj.weight.data
     
-    def attn_interface_out(self, layer: nn.Module):
+    def attn_interface(self, layer: nn.Module):
         return layer.self_attn.source.attention_interface_0
 
     def o_proj_weights(self, layer: nn.Module):
@@ -294,10 +329,14 @@ class Llama2ModelAdapter(ModelAdapter):
         sigma = torch.sqrt(variance + norm.variance_epsilon)
         
         u = (grad * norm.weight.data).float()
-        u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
         
-        term2 = (u_dot_x / (self.model_dim * (variance + norm.variance_epsilon))) * x_pre_norm
-        grad_pre_norm = (u - term2) / sigma
+        if self.frozen_norm == True:
+            grad_pre_norm =  u / sigma
+        
+        else:
+            u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
+            term2 = (u_dot_x / (self.model_dim * (variance + norm.variance_epsilon))) * x_pre_norm
+            grad_pre_norm = (u - term2) / sigma
         
         return grad_pre_norm.to(input_dtype)
     
@@ -363,40 +402,6 @@ class Llama2ModelAdapter(ModelAdapter):
     
 
 
-class FrozenModelAdapter(Llama2ModelAdapter):
-
-    def k_proj_out(self, layer: nn.Module):
-        return layer.self_attn.source.eager_attention_forward_0.source.repeat_kv_0
-
-    def v_proj_out(self, layer: nn.Module):
-        return layer.self_attn.source.eager_attention_forward_0.source.repeat_kv_1
-    
-    def attn_interface_out(self, layer: nn.Module):
-        return layer.self_attn.source.eager_attention_forward_0
-
-    @torch.no_grad() 
-    def _compute_norm_input_gradient(
-        self,
-        grad: torch.Tensor,
-        x_pre_norm: torch.Tensor,
-        norm: nn.Module,
-    ):
-        input_dtype = grad.dtype
-        x_pre_norm = x_pre_norm.float()
-
-        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
-            x_pre_norm = x_pre_norm.unsqueeze(1)
-
-        variance = (x_pre_norm ** 2).mean(dim=-1, keepdim=True)
-        sigma = torch.sqrt(variance + norm.variance_epsilon)
-        
-        u = (grad * norm.weight.data).float()
-        grad_pre_norm = u / sigma
-        
-        return grad_pre_norm.to(input_dtype)
-    
-
-
 
 
 # ------------------------------------------------------------------
@@ -423,23 +428,112 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
         sigma = torch.sqrt(variance + norm.eps)
         
         u = grad * norm.weight.data.float()
-        u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
-        
-        term2 = (u_dot_x / (self.model_dim * (variance + norm.eps))) * x_pre_norm
-        grad_pre_norm = (u - term2) / sigma
+
+        if self.frozen_norm == True:
+            grad_pre_norm = u / sigma
+
+        else:
+            u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
+            
+            term2 = (u_dot_x / (self.model_dim * (variance + norm.eps))) * x_pre_norm
+            grad_pre_norm = (u - term2) / sigma
         
         return grad_pre_norm.to(input_dtype)
+
     
-class FrozenGemma2ModelAdapter(Llama2ModelAdapter):
+
+
+
+
+# ------------------------------------------------------------------
+# GPT2 
+# ------------------------------------------------------------------
+
+class GPT2ModelAdapter(ModelAdapter):
+
+    @property
+    def uses_rotary_emb(self):
+        return False
+    
+    @property
+    def n_layers(self):
+        return self.config.n_layer
+
+    @property
+    def n_heads(self):
+        return self.config.n_head
+
+    @property
+    def model_dim(self):
+        return self.config.n_embd
+
+    @property
+    def head_dim(self):
+        return self.model_dim // self.n_heads
+
+    @property
+    def embed_tokens(self) -> nn.Module:
+        return self.model.transformer.wte
+
+    @property
+    def layers(self) -> nn.Module:
+        return self.model.transformer.h
+    
+    @property
+    def lm_head(self):
+        return self.model.lm_head
+
+    def ln_1(self, layer: nn.Module):
+        return layer.ln_1
+
+    def build_attn_source(self, layer):
+        layer.attn.source
+
+    def q_proj_out(self, layer: nn.Module):
+        return layer.attn.source.split_1.output[0]
+    
+    def q_proj_weights(self, layer: nn.Module):
+        return layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 0, :]
 
     def k_proj_out(self, layer: nn.Module):
-        return layer.self_attn.source.eager_attention_forward_0.source.repeat_kv_0
+        return layer.attn.source.transpose_2.output
+    
+    def k_proj_weights(self, layer: nn.Module):
+        return layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 1, :]
 
     def v_proj_out(self, layer: nn.Module):
-        return layer.self_attn.source.eager_attention_forward_0.source.repeat_kv_1
+        return layer.attn.source.transpose_3.output
     
-    def attn_interface_out(self, layer: nn.Module):
-        return layer.self_attn.source.eager_attention_forward_0
+    def v_proj_weights(self, layer: nn.Module):
+        return layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 2, :]
+    
+    def attn_interface(self, layer: nn.Module):
+        return layer.attn.source.attention_interface_0
+
+    def o_proj_weights(self, layer: nn.Module):
+        return layer.attn.c_proj.weight.data
+
+    def ln_2(self, layer: nn.Module):
+        return layer.ln_2
+
+    def mlp(self, layer: nn.Module):
+        return layer.mlp
+    
+    def compute_per_head_attn_out(self, z: torch.Tensor, W_linear: torch.Tensor) -> torch.Tensor:
+        _, _, H, d = z.shape
+        # Conv_1D stores weights in (n_in, n_out)
+        W_linear = W_linear.reshape(H, d, -1).detach()
+        return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
+
+    def compute_mlp_input_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module
+    ):
+        return self._compute_norm_input_gradient(
+            grad=grad, x_pre_norm=x_pre_norm, norm=self.ln_2(layer)
+        )
 
     @torch.no_grad() 
     def _compute_norm_input_gradient(
@@ -449,16 +543,79 @@ class FrozenGemma2ModelAdapter(Llama2ModelAdapter):
         norm: nn.Module,
     ):
         input_dtype = grad.dtype
-        grad = grad.float()
         x_pre_norm = x_pre_norm.float()
 
         if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
             x_pre_norm = x_pre_norm.unsqueeze(1)
 
-        variance = (x_pre_norm ** 2).mean(dim=-1, keepdim=True)
+        mean = x_pre_norm.mean(dim=-1, keepdim=True)
+        x_centered = x_pre_norm - mean
+
+        variance = (x_centered ** 2).mean(dim=-1, keepdim=True)
         sigma = torch.sqrt(variance + norm.eps)
         
-        u = grad * norm.weight.data.float()
-        grad_pre_norm = u / sigma
+        u = (grad * norm.weight.data).float()
+        
+        if self.frozen_norm == True:
+            grad_pre_norm = (u - mean) / sigma
+            
+        else:
+            u_mean = u.mean(dim=-1, keepdim=True)
+            u_dot_xc = (u * x_centered).sum(dim=-1, keepdim=True)
+            term2 = (u_dot_xc / (self.model_dim * (variance + norm.eps))) * x_centered
+            grad_pre_norm = (u - u_mean - term2) / sigma
         
         return grad_pre_norm.to(input_dtype)
+    
+    def compute_headwise_query_input_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module,
+        cache: dict,
+    ):
+        B, S, _ = grad.shape
+        grad = grad.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        return self._compute_headwise_attn_gradient(
+            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.q_proj_weights(layer), norm=self.ln_1(layer)
+        )
+    
+    def compute_headwise_key_input_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module,
+        cache: dict,
+    ):
+        return self._compute_headwise_attn_gradient(
+            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.k_proj_weights(layer), norm=self.ln_1(layer)
+        )
+    
+    def compute_headwise_value_input_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module,
+        cache: dict,
+    ):
+        return self._compute_headwise_attn_gradient( 
+            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.v_proj_weights(layer), norm=self.ln_1(layer)
+        )
+
+    @torch.no_grad() 
+    def _compute_headwise_attn_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        W_linear: torch.Tensor,
+        norm: nn.Module,
+        rot_embeds: torch.Tensor = None,
+    ):
+        # STEP 1: Backprop through the projection
+        W_linear = W_linear.T.reshape(-1, self.head_dim, self.model_dim)  # Conv_1D stores weights in (n_in, n_out)
+        grad_post_norm = torch.einsum('bhsd, hdD -> bhsD', grad, W_linear)
+        
+        # STEP 2: Backprop through the LayerNorm
+        grad_pre_norm = self._compute_norm_input_gradient(grad_post_norm, x_pre_norm, norm)
+        
+        return grad_pre_norm.transpose(0, 1)
