@@ -1,136 +1,59 @@
 """
-DPEA (Dual Path Edge Attribution) for MIB benchmark.
-
-Uses FastEdgeTracer (vectorized, streaming backward) for attribution.
-Only processes tasks that don't already have an importances.json file.
+Circuit attribution via EdgeCircuitTracer (LVP / DPA method).
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python -m experiments.mib.run_fast_attribution
+    CUDA_VISIBLE_DEVICES=0 python -m experiments.mib.run_attribution \\
+        --models qwen2.5 gemma2 \\
+        --tasks ioi mcqa \\
+        --split train \\
+        --num-examples 100 \\
+        --output-dir experiments/mib/MIB-circuit-track/circuits
 """
 
+import argparse
+import json
+import logging
 import os
 import time
+
 import torch
-from torch.utils.data import DataLoader, Dataset
-from datetime import datetime
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from nnsight import LanguageModel
-from transformers import AutoTokenizer, AutoConfig
-from datasets import load_dataset
+from experiments.mib.data_utils import MIBDataset, create_mib_circuit
+from linear_transformer import patch_model_for_lvp
+from tracer.model_adapters import Llama2ModelAdapter, Gemma2ModelAdapter, GPT2ModelAdapter, ModelAdapter
+from tracer.tracer import EdgeCircuitTracer
 
-from tracer.backend import BACKEND_MAPPING
-from tracer.tracer import FastEdgeTracer
-from experiments.mib.create_mib_circuite import build_graph_json
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-CIRCUIT_DIR = "experiments/mib/MIB-circuit-track/circuits"
-SPLIT = "train"
-NUM_EXAMPLES = 100
-
-MIB_TO_DPA_MODEL = {
+MIB_MODEL_TO_HF_ID: dict[str, str] = {
+    "gpt2": "gpt2",
     "qwen2.5": "Qwen/Qwen2.5-0.5B",
     "llama3": "meta-llama/Llama-3.1-8B",
+    "gemma2": "google/gemma-2-2b",
 }
 
-TASKS_TO_HF_NAMES = {
-    'ioi': 'ioi',
-    'mcqa': 'copycolors_mcqa',
-    'arithmetic_addition': 'arithmetic_addition',
-    'arithmetic_subtraction': 'arithmetic_subtraction',
-    'arc_easy': 'arc_easy',
-    'arc_challenge': 'arc_challenge',
+MIB_MODEL_TO_ADAPTER_CLS: dict[str, type | None] = {
+    "gpt2": GPT2ModelAdapter,
+    "qwen2.5": Llama2ModelAdapter,
+    "llama3": Llama2ModelAdapter,
+    "gemma2": Gemma2ModelAdapter,
 }
 
+DEFAULT_BATCH_SIZES: dict[str, int] = {
+    "gpt2": 64,
+    "qwen2.5": 32,
+    "llama3": 4,
+    "gemma2": 16,
+}
 
-def collate_fn(xs):
-    clean, corrupted, labels = zip(*xs)
-    return list(clean), list(corrupted), labels
-
-
-class MIBDataset(Dataset):
-    """Minimal MIB dataset loader (no transformer_lens dependency)."""
-
-    def __init__(self, task, tokenizer, model_name, split='train', num_examples=None):
-        self.task = task
-        self.tokenizer = tokenizer
-        self.model_name = model_name
-
-        hf_url = f"mib-bench/{TASKS_TO_HF_NAMES[task]}"
-        if task == 'mcqa':
-            self.dataset = load_dataset(hf_url, '4_answer_choices', split=split)
-            self.counterfactual_type = "symbol_counterfactual"
-        elif task.startswith('arc'):
-            self.dataset = load_dataset(hf_url, split=split)
-            self.counterfactual_type = "symbol_counterfactual"
-        elif task.startswith('arithmetic'):
-            self.dataset = load_dataset(hf_url, split=split)
-            self.operator = "-" if "subtraction" in task else "+"
-        else:
-            self.dataset = load_dataset(hf_url, split=split)
-
-        self.dataset = self._filter()
-        if num_examples and num_examples < len(self.dataset):
-            self.dataset = self.dataset.select(range(num_examples))
-
-    def _filter(self):
-        tok = self.tokenizer
-        if self.task == 'ioi':
-            return self.dataset.filter(
-                lambda x: (
-                    len(tok(f" {x['metadata']['indirect_object']}", add_special_tokens=False).input_ids) ==
-                    len(tok(f" {x['metadata']['subject']}", add_special_tokens=False).input_ids) and
-                    len(tok(f" {x['metadata']['indirect_object']}", add_special_tokens=False).input_ids) ==
-                    len(tok(f" {x['metadata']['random_c']}", add_special_tokens=False).input_ids)
-                )
-            )
-        elif self.task == 'mcqa' or self.task.startswith('arc'):
-            ct = self.counterfactual_type
-            return self.dataset.filter(
-                lambda x: (
-                    len(tok(x["choices"]["label"][x["answerKey"]], add_special_tokens=False).input_ids) ==
-                    len(tok(str(x[ct]["choices"]["label"][x[ct]["answerKey"]]), add_special_tokens=False).input_ids)
-                )
-            )
-        elif self.task.startswith('arithmetic'):
-            op = self.operator
-            return self.dataset.filter(
-                lambda x: (
-                    len(tok(str(x["label"]), add_special_tokens=False).input_ids) == 1 and
-                    x["random_counterfactual"] is not None and
-                    x["random_counterfactual"]["prompt"] is not None and
-                    x["operator"] == op and
-                    len(tok(str(x["random_counterfactual"]["label"]), add_special_tokens=False).input_ids) == 1
-                )
-            )
-        return self.dataset
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        row = self.dataset[index]
-        tok = self.tokenizer
-
-        if self.task == 'ioi':
-            correct_idx = tok(f" {row['metadata']['indirect_object']}", add_special_tokens=False).input_ids[0]
-            incorrect_idx = tok(f" {row['metadata']['subject']}", add_special_tokens=False).input_ids[0]
-            cf = row.get("s2_io_flip_counterfactual", row.get("counterfactual", {}))
-            return row["prompt"], cf.get("prompt", row["prompt"]), [correct_idx, incorrect_idx]
-
-        elif self.task == 'mcqa' or self.task.startswith('arc'):
-            ct = self.counterfactual_type
-            correct_idx = tok(row["choices"]["label"][row["answerKey"]], add_special_tokens=False).input_ids[0]
-            cf = row[ct]
-            incorrect_idx = tok(str(cf["choices"]["label"][cf["answerKey"]]), add_special_tokens=False).input_ids[0]
-            return row["prompt"], cf["prompt"], [correct_idx, incorrect_idx]
-
-        elif self.task.startswith('arithmetic'):
-            correct_idx = tok(str(row["label"]), add_special_tokens=False).input_ids[0]
-            cf = row["random_counterfactual"]
-            incorrect_idx = tok(str(cf["label"]), add_special_tokens=False).input_ids[0]
-            return row["prompt"], cf["prompt"], [correct_idx, incorrect_idx]
-
-# All valid combos. Will skip ones already done.
 ALL_COMBOS = [
+    ("ioi", "gpt2"),
     ("ioi", "qwen2.5"),
     ("mcqa", "qwen2.5"),
     ("ioi", "llama3"),
@@ -139,138 +62,171 @@ ALL_COMBOS = [
     ("arithmetic_subtraction", "llama3"),
     ("arc_easy", "llama3"),
     ("arc_challenge", "llama3"),
+    ("ioi", "gemma2"),
+    ("mcqa", "gemma2"),
+    ("arc_easy", "gemma2"),
 ]
 
 
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="DPA circuit attribution via EdgeCircuitTracer.")
+    parser.add_argument(
+        "--models", nargs="+",
+        default=list(MIB_MODEL_TO_HF_ID.keys()),
+        choices=list(MIB_MODEL_TO_HF_ID.keys()),
+    )
+    parser.add_argument(
+        "--tasks", nargs="+",
+        default=["ioi", "mcqa", "arithmetic_addition", "arithmetic_subtraction", "arc_easy", "arc_challenge"],
+    )
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--num-examples", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=None, help="Overrides per-model defaults.")
+    parser.add_argument("--output-dir", default="experiments/mib/MIB-circuit-track/circuits")
+    parser.add_argument("--method-name", default="dpa_patching_edge",
+                        help="Subdirectory name under output-dir identifying this run's method/config.")
+    parser.add_argument("--use-counterfactual", action="store_true")
+    parser.add_argument("--integration-steps", type=int, default=1,
+                        help="Number of integration steps for IG-style attribution (1 = plain gradient).")
+
+    # patch_model_for_lvp kwargs
+    parser.add_argument(
+        "--attn-act-fn", default="softmax",
+        help="Attention softmax rule (Rule 3). Key into ACT_FN, e.g. dtd_softmax, sec_jac_softmax.",
+    )
+    parser.add_argument(
+        "--matmul-fn", default="matmul",
+        help="QK and AV matmul rule (Rule 4). Key into BILINEAR_FN.",
+    )
+    parser.add_argument(
+        "--mul-fn", default="mul",
+        help="Gate x up product rule (Rule 4). Key into BILINEAR_FN.",
+    )
+    parser.add_argument(
+        "--mlp-act-fn", default=None,
+        help="MLP activation rule (Rule 2). Key into ACT_FN. Defaults to model-specific LVP fn.",
+    )
+    parser.add_argument(
+        "--frozen-norm", dest="frozen_norm", action="store_true", default=False,
+        help="Disable detaching the normalisation factor in RMSNorm/LayerNorm (Rule 1).",
+    )
+    parser.add_argument(
+        "--ignore-norm", dest="ignore_norm", action="store_true", default=False,
+        help="Ignores norms on backward pass",
+    )
+    parser.add_argument(
+        "--center-writing-weights", dest="center_writing_weights", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--attn-softcap-fn", default="tanh",
+        help="Gemma2 logit softcap rule (Rule 2). Key into ACT_FN.",
+    )
+
+    parser.add_argument(
+        "--force", dest="force", action="store_true", default=False,
+    )
+    return parser.parse_args()
 
 
-def run():
-    log("=" * 60)
-    log("FAST DPA Edge Attribution (FastEdgeTracer)")
-    log(f"GPU: {torch.cuda.get_device_name(0)}")
-    log("=" * 60)
+def _load_model_components(
+    model_name: str, lvp_kwargs: dict, args
+) -> tuple[AutoTokenizer, ModelAdapter, EdgeCircuitTracer]:
+    adapter_cls: type[ModelAdapter] = MIB_MODEL_TO_ADAPTER_CLS[model_name]
+    if adapter_cls is None:
+        raise NotImplementedError(f"No ModelAdapter implemented for '{model_name}'")
 
-    current_model_name = None
-    model = None
-    tracer = None
-    tokenizer = None
-    model_config = None
+    model_id = MIB_MODEL_TO_HF_ID[model_name]
+    logger.info("Loading %s (%s)", model_name, model_id)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.padding_side = "left"
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dtype = torch.bfloat16 if model_id != 'gpt2' else torch.float
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto",
+    ).eval()
+    model = patch_model_for_lvp(model, **lvp_kwargs)
+
+    adapter = adapter_cls(model, frozen_norm = lvp_kwargs['frozen_norm'], ignore_norm=args.ignore_norm)
+    tracer = EdgeCircuitTracer(adapter, tokenizer)
+    return tokenizer, adapter, tracer
+
+
+def run() -> None:
+    args = parse_args()
+
+    lvp_kwargs = {
+        "attn_act_fn": args.attn_act_fn,
+        "matmul_fn": args.matmul_fn,
+        "mul_fn": args.mul_fn,
+        "frozen_norm": args.frozen_norm,
+        "attn_softcap_fn": args.attn_softcap_fn,
+        "center_writing_weights": args.center_writing_weights,
+    }
+    if args.mlp_act_fn is not None:
+        lvp_kwargs["mlp_act_fn"] = args.mlp_act_fn
+
+    logger.info("=" * 60)
+    logger.info("DPA Circuit Attribution (EdgeCircuitTracer / LVP)")
+    if torch.cuda.is_available():
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
+    logger.info("models=%s  tasks=%s  split=%s  n=%d", args.models, args.tasks, args.split, args.num_examples)
+    logger.info("method=%s  integration_steps=%d  counterfactual=%s", args.method_name, args.integration_steps, args.use_counterfactual)
+    logger.info("lvp: %s", lvp_kwargs)
+    logger.info("=" * 60)
 
     total_start = time.time()
+    all_requested = [(task, model) for model in args.models for task in args.tasks]
+    combos = [c for c in all_requested if c in ALL_COMBOS]
+    skipped = [c for c in all_requested if c not in ALL_COMBOS]
+    if skipped:
+        logger.warning("Skipping unsupported (task, model) combos: %s", skipped)
 
-    for i, (task, model_name) in enumerate(ALL_COMBOS):
-        task_col = f"{task.replace('_', '-')}_{model_name}"
-        model_id = MIB_TO_DPA_MODEL[model_name]
+    current_model_name = None
+    tokenizer = adapter = tracer = None
 
-        method_name = "dpa_patching_edge"
-        circuit_path = os.path.join(CIRCUIT_DIR, method_name, task_col)
-        output_path = os.path.join(circuit_path, "importances.json")
-        if os.path.exists(output_path):
-            log(f"[{i+1}/{len(ALL_COMBOS)}] {task_col} already done, skipping")
+    for task, model_name in combos:
+        tag = f"{task.replace('_', '-')}_{model_name}"
+        circuit_dir = os.path.join(args.output_dir, args.method_name, tag)
+        mib_output_path = os.path.join(circuit_dir, "importances.json")
+        score_output_path = os.path.join(circuit_dir, "scores.pt")
+
+        if os.path.exists(mib_output_path) and args.force == False:
+            logger.info("Skip %s (exists)", tag)
             continue
 
         if model_name != current_model_name:
-            if model is not None:
-                del model, tracer
+            if tracer is not None:
+                del tokenizer, adapter, tracer
                 torch.cuda.empty_cache()
-
-            log(f"\nLoading model: {model_name} ({model_id})")
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            tokenizer.padding_side = 'left'
-            if not tokenizer.pad_token:
-                tokenizer.pad_token = tokenizer.eos_token
-
-            if model_name == "qwen2.5":
-                batch_size = 32
-            else:
-                batch_size = 4
-
-            model = LanguageModel(
-                model_id,
-                attn_implementation='eager',
-                device_map='auto',
-                dispatch=True,
-                dtype=torch.bfloat16,
-            )
-
-            backend_cls = BACKEND_MAPPING[model_id]
-            backend = backend_cls(model)
-            tracer = FastEdgeTracer(backend, tokenizer)
-
-            cfg = AutoConfig.from_pretrained(model_id)
-            model_config = {
-                "n_layers": cfg.num_hidden_layers,
-                "n_heads": cfg.num_attention_heads,
-                "d_model": cfg.hidden_size,
-                "parallel_attn_mlp": False,
-            }
+            tokenizer, adapter, tracer = _load_model_components(model_name, lvp_kwargs, args)
             current_model_name = model_name
 
-        n_fwd = 1 + model_config['n_layers'] * (model_config['n_heads'] + 1)
-        n_bwd = model_config['n_layers'] * (3 * model_config['n_heads'] + 1) + 1
-
-        log(f"\n[{i+1}/{len(ALL_COMBOS)}] {task} / {model_name}")
+        batch_size = args.batch_size or DEFAULT_BATCH_SIZES[model_name]
+        logger.info("[%s] bs=%d", tag, batch_size)
 
         t0 = time.time()
-        dataset = MIBDataset(
-            task, tokenizer, model_name,
-            split=SPLIT, num_examples=NUM_EXAMPLES,
-        )
-        dataloader = DataLoader(
-            dataset, batch_size=batch_size,
-            collate_fn=collate_fn, shuffle=False,
-        )
-        log(f"  Dataset: {len(dataset)} examples, {len(dataloader)} batches (bs={batch_size})")
+        dataset = MIBDataset(task, tokenizer, model_name, split=args.split, num_examples=args.num_examples)
+        dataloader = dataset.dataloader(batch_size)
+        logger.info("  %d examples, %d batches", len(dataset), len(dataloader))
 
-        all_scores = torch.zeros(n_fwd, n_bwd)
-        total_items = 0
+        scores = tracer.build_circuit(dataloader, use_counterfactual=args.use_counterfactual, integration_steps=args.integration_steps)
+        circuit = create_mib_circuit(scores, adapter.n_layers, adapter.n_heads, adapter.model_dim)
 
-        for batch_idx, (clean_strs, corrupt_strs, labels) in enumerate(dataloader):
-            bs = len(clean_strs)
-            total_items += bs
+        os.makedirs(circuit_dir, exist_ok=True)
+        with open(mib_output_path, "w") as f:
+            json.dump(circuit, f, indent=2)
+        torch.save(scores, score_output_path)
+        
+        logger.info("  Done in %.1fs — saved %s", time.time() - t0, circuit_dir)
 
-            clean_enc = tokenizer(list(clean_strs), return_tensors='pt', padding=True)
-            corrupt_enc = tokenizer(list(corrupt_strs), return_tensors='pt', padding=True)
 
-            if isinstance(labels[0], (list, tuple)):
-                target_ids = torch.tensor([l[0] for l in labels])
-            else:
-                target_ids = torch.tensor(list(labels))
-
-            clean_batch = {
-                'input_ids': clean_enc['input_ids'],
-                'attention_mask': clean_enc['attention_mask'],
-                'targets': target_ids,
-            }
-            corrupt_batch = {
-                'input_ids': corrupt_enc['input_ids'],
-                'attention_mask': corrupt_enc['attention_mask'],
-            }
-
-            bt0 = time.time()
-            batch_scores = tracer.trace(clean_batch, corrupt_batch, target_ids)
-            bt_elapsed = time.time() - bt0
-            all_scores += batch_scores * bs
-
-            if batch_idx == 0 or (batch_idx + 1) % 5 == 0:
-                log(f"  Batch {batch_idx+1}/{len(dataloader)} ({bt_elapsed:.1f}s), items: {total_items}")
-
-        all_scores /= total_items
-
-        os.makedirs(circuit_path, exist_ok=True)
-        build_graph_json(all_scores, model_config, output_path)
-
-        elapsed = time.time() - t0
-        n_nonzero = (all_scores != 0).sum().item()
-        log(f"  Done in {elapsed:.1f}s — non-zero: {n_nonzero}, saved: {output_path}")
-
-    total_elapsed = time.time() - total_start
-    log(f"\n{'='*60}")
-    log(f"All attribution done! Total: {total_elapsed/60:.1f} min")
-    log(f"{'='*60}")
+    logger.info("=" * 60)
+    logger.info("Total: %.1f min", (time.time() - total_start) / 60)
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
