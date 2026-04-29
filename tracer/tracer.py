@@ -47,6 +47,9 @@ class EdgeCircuitTracer:
         try: 
             for batch in tqdm(dataloader):
                 clean_prompts, corrupt_prompts, clean_targets, corrupt_targets = batch
+                # corrupt_tokens = self.tokenizer.convert_ids_to_tokens(corrupt_targets)
+                # clean_tokens = self.tokenizer.convert_ids_to_tokens(clean_targets)
+                # print(list(zip(clean_prompts, clean_tokens, corrupt_prompts, corrupt_tokens)))
 
                 clean_inputs = self.tokenizer(clean_prompts, padding=True, return_tensors='pt')
                 corrupt_inputs = self.tokenizer(corrupt_prompts, padding=True, return_tensors='pt')
@@ -58,14 +61,14 @@ class EdgeCircuitTracer:
                     if use_counterfactual == True or integration_steps > 1:
                         with self.model.trace(**corrupt_inputs):
                             self._forward_pass_and_cache()
-                        self.corrupt_embeds = self.cache[-1]['out'].detach().clone()
+                        self.corrupt_embeds = self.cache['emb'].detach().clone()
                         self.baseline_2d_cache = self.source_2d_cache
                         self.source_2d_cache = self._init_source_cache()
                         
 
                     with self.model.trace(**clean_inputs):
                         self._forward_pass_and_cache()
-                        self.clean_embeds = self.cache[-1]['out'].detach().clone()
+                        self.clean_embeds = self.cache['emb'].detach().clone()
                         metric = self._get_metric(clean_targets, corrupt_targets)
 
                         if use_counterfactual == True or integration_steps > 1:
@@ -77,12 +80,11 @@ class EdgeCircuitTracer:
 
                     if integration_steps > 1:
                         self.disable_source_caching = True
-                        for alpha in torch.linspace(0, 1, integration_steps)[1:]:
+                        for alpha in torch.linspace(0, 1, integration_steps + 1)[1:-1]:
                             with self.model.trace(**clean_inputs):
-                                integrated_embeds = (1- alpha) * self.clean_embeds + alpha * self.corrupt_embeds
+                                integrated_embeds = (1 - alpha) * self.clean_embeds + alpha * self.corrupt_embeds
                                 self._forward_pass_and_cache(integrated_embeds)
                                 metric = self._get_metric(clean_targets, corrupt_targets)
-                                
                                 self.num_processed_samples += self.curr_batch_size
                                 self._backward_pass_and_scoring(metric)
 
@@ -112,16 +114,17 @@ class EdgeCircuitTracer:
 
     def _forward_pass_and_cache(self, integrated_embeds: torch.Tensor | None = None):
 
+        if integrated_embeds is not None:
+            self.adapter.embed_tokens.output = integrated_embeds
+
+        self.cache['emb'] = self.adapter.embed_tokens.output
+
         if self.adapter.uses_rotary_emb:
             rot_cos, rot_sin = self.adapter.rotary_emb.output
             self.cache['rotary_emb'] = (rot_cos.detach(), rot_sin.detach())
 
-
-        # use first layer input to aggregate gpt2 embeddings
         first_layer = self.adapter.layers[0]
-        if integrated_embeds is not None:
-            first_layer.input = integrated_embeds
-        self.cache[-1]['out'] = first_layer.input
+        self.cache[-1]['out'] = self.adapter.ln_1(first_layer).input
         self._update_source_2d_cache(
             self.adapter.ln_1(first_layer).input.reshape(1, self.BSD), type='emb'
         )
@@ -135,7 +138,7 @@ class EdgeCircuitTracer:
             self.cache[layer_id]['v_proj_out'] = self.adapter.v_proj_out(layer)
 
             attn_out = self.adapter.compute_per_head_attn_out(
-                self.adapter.attn_interface(layer).output[0].detach(), self.adapter.o_proj_weights(layer)
+                self.adapter.attn_interface(layer).output[0].detach(), layer
             ).reshape(self.adapter.n_heads, self.BSD)
             self._update_source_2d_cache(attn_out, type='attn', layer_id=layer_id)
 
