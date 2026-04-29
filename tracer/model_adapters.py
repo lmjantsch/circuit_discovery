@@ -7,13 +7,14 @@ from tracer.modeling_utils import apply_inverse_rope
 
 class ModelAdapter(ABC):
 
-    def __init__(self, model, frozen_norm: bool = True):
+    def __init__(self, model, frozen_norm: bool = False, ignore_norm: bool = False):
         self.model = model
         self.config = model.config
         self.device = model.device
         self.dtype = model.dtype
 
         self.frozen_norm = frozen_norm
+        self.ignore_norm = ignore_norm
 
     @property
     def source_dims(self) -> int:
@@ -145,7 +146,7 @@ class ModelAdapter(ABC):
         pass
 
     @abstractmethod
-    def compute_per_head_attn_out(self, z: torch.Tensor, W_linear: torch.Tensor) -> torch.Tensor:
+    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
@@ -297,8 +298,9 @@ class Llama2ModelAdapter(ModelAdapter):
         return layer.mlp
 
 
-    def compute_per_head_attn_out(self, z: torch.Tensor, W_linear: torch.Tensor) -> torch.Tensor:
+    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
         _, _, H, d = z.shape
+        W_linear = self.o_proj_weights(layer)
         W_linear = W_linear.T.reshape(H, d, -1).detach()
         return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
 
@@ -319,6 +321,9 @@ class Llama2ModelAdapter(ModelAdapter):
         x_pre_norm: torch.Tensor,
         norm: nn.Module,
     ):
+        if self.ignore_norm == True:
+            return grad
+
         input_dtype = grad.dtype
         x_pre_norm = x_pre_norm.float()
 
@@ -410,6 +415,28 @@ class Llama2ModelAdapter(ModelAdapter):
 
 class Gemma2ModelAdapter(Llama2ModelAdapter):
 
+    def ln_2(self, layer: nn.Module):
+        return layer.pre_feedforward_layernorm
+
+    def mlp(self, layer: nn.Module):
+        return layer.post_feedforward_layernorm
+    
+    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
+        _, _, H, d = z.shape
+        W_linear = self.o_proj_weights(layer)
+        W_linear = W_linear.T.reshape(H, d, -1).detach()
+
+        per_head_attn_out = torch.einsum('BSHd, HdD -> HBSD', z, W_linear).float()
+
+        eps = layer.post_attention_layernorm.eps
+        norm_weight = layer.post_attention_layernorm.weight
+        norm_scalar = torch.rsqrt(per_head_attn_out.sum(dim=0).pow(2).mean(-1, keepdim=True) + eps)
+
+        result = per_head_attn_out * norm_scalar * (1.0 + norm_weight.float())
+
+        return result.to(z.dtype)
+    
+
     @torch.no_grad() 
     def _compute_norm_input_gradient(
         self,
@@ -417,6 +444,9 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
         x_pre_norm: torch.Tensor,
         norm: nn.Module,
     ):
+        if self.ignore_norm == True:
+            return grad
+        
         input_dtype = grad.dtype
         grad = grad.float()
         x_pre_norm = x_pre_norm.float()
@@ -519,8 +549,9 @@ class GPT2ModelAdapter(ModelAdapter):
     def mlp(self, layer: nn.Module):
         return layer.mlp
     
-    def compute_per_head_attn_out(self, z: torch.Tensor, W_linear: torch.Tensor) -> torch.Tensor:
+    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
         _, _, H, d = z.shape
+        W_linear = self.o_proj_weights(layer)
         # Conv_1D stores weights in (n_in, n_out)
         W_linear = W_linear.reshape(H, d, -1).detach()
         return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
@@ -542,6 +573,7 @@ class GPT2ModelAdapter(ModelAdapter):
         x_pre_norm: torch.Tensor,
         norm: nn.Module,
     ):
+
         input_dtype = grad.dtype
         x_pre_norm = x_pre_norm.float()
 
@@ -555,8 +587,11 @@ class GPT2ModelAdapter(ModelAdapter):
         sigma = torch.sqrt(variance + norm.eps)
         
         u = (grad * norm.weight.data).float()
+
+        if self.ignore_norm == True:
+            return u
         
-        if self.frozen_norm == True:
+        if self.frozen_norm == True: # subtract x.mean() to fully linearize norm transformation
             grad_pre_norm = (u - mean) / sigma
             
         else:
