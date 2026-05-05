@@ -193,10 +193,8 @@ def run() -> None:
     for task, model_name in combos:
         tag = f"{task.replace('_', '-')}_{model_name}"
         circuit_dir = os.path.join(args.output_dir, args.method_name, tag)
-        mib_output_path = os.path.join(circuit_dir, "importances.json")
-        score_output_path = os.path.join(circuit_dir, "scores.pt")
 
-        if os.path.exists(mib_output_path) and args.force == False:
+        if os.path.exists(os.path.join(circuit_dir, "importances.json")) and args.force == False:
             logger.info("Skip %s (exists)", tag)
             continue
 
@@ -215,14 +213,16 @@ def run() -> None:
         dataloader = dataset.dataloader(batch_size)
         logger.info("  %d examples, %d batches", len(dataset), len(dataloader))
 
-        scores = tracer.build_circuit(dataloader, use_counterfactual=args.use_counterfactual, integration_steps=args.integration_steps)
+        (scores, variance) = tracer.build_circuit(dataloader, use_counterfactual=args.use_counterfactual, integration_steps=args.integration_steps)
         circuit = create_mib_circuit(scores, adapter.n_layers, adapter.n_heads, adapter.model_dim)
 
         os.makedirs(circuit_dir, exist_ok=True)
-        with open(mib_output_path, "w") as f:
+        with open(os.path.join(circuit_dir, 'importances.json'), "w") as f:
             json.dump(circuit, f, indent=2)
-        torch.save(scores, score_output_path)
-        
+        torch.save(scores, os.path.join(circuit_dir, 'scores.pt'))
+        if variance != None:
+            torch.save(variance, os.path.join(circuit, 'variance.pt'))
+         
         logger.info("  Done in %.1fs — saved %s", time.time() - t0, circuit_dir)
 
 
