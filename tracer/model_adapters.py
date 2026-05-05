@@ -7,14 +7,14 @@ from tracer.modeling_utils import apply_inverse_rope
 
 class ModelAdapter(ABC):
 
-    def __init__(self, model, frozen_norm: bool = False, ignore_norm: bool = False):
+    def __init__(self, model, ignore_norm: bool = False, frozen_norm: bool = False):
         self.model = model
         self.config = model.config
         self.device = model.device
         self.dtype = model.dtype
 
-        self.frozen_norm = frozen_norm
         self.ignore_norm = ignore_norm
+        self.frozen_norm = frozen_norm
 
     @property
     def source_dims(self) -> int:
@@ -80,10 +80,10 @@ class ModelAdapter(ABC):
             return slice(start, start + self.n_heads)
         else:
             raise NotImplementedError(f"Type '{type}' is not implemented.")
-    
+
     @property
     @abstractmethod
-    def embed_tokens(self) -> nn.Module:
+    def emb(self) -> nn.Module:
         pass
 
     @property
@@ -91,70 +91,114 @@ class ModelAdapter(ABC):
     def layers(self) -> nn.Module:
         pass
     
-    @property
+    # embeddings
     @abstractmethod
-    def lm_head(self):
+    def emb_in(self) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def ln_1(self, layer: nn.Module):
+    def emb_out(self) -> torch.Tensor:
+        pass
+
+    # residual positions
+    @abstractmethod
+    def residual_in(self, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def build_attn_source(self, layer):
+    def residual_mid(self, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def q_proj_out(self, layer: nn.Module):
+    def residual_out(self, layer: nn.Module) -> torch.Tensor:
         pass
-    
+
+    # attention helpers
     @abstractmethod
-    def q_proj_weights(self, layer: nn.Module):
+    def build_attn_source(self, layer) -> None:
+        pass
+
+    # attention
+    @abstractmethod
+    def query_out(self, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def k_proj_out(self, layer: nn.Module):
-        pass
-    
-    @abstractmethod
-    def k_proj_weights(self, layer: nn.Module):
+    def key_out(self, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def v_proj_out(self, layer: nn.Module):
-        pass
-    
-    @abstractmethod
-    def v_proj_weights(self, layer: nn.Module):
-        pass
-    
-    @abstractmethod
-    def attn_interface(self, layer: nn.Module):
+    def value_out(self, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def o_proj_weights(self, layer: nn.Module):
+    def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
         pass
 
-
+    # mlp
     @abstractmethod
-    def ln_2(self, layer: nn.Module):
-        pass
-
-    @abstractmethod
-    def mlp(self, layer: nn.Module):
+    def mlp_in(self, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
+    def mlp_out(self, layer: nn.Module) -> torch.Tensor:
         pass
 
+    # logits
     @abstractmethod
-    def compute_mlp_input_gradient(
+    def logits(self):
+        pass
+
+
+    # graients 
+    @abstractmethod
+    def mlp_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         layer: nn.Module
+    ):
+        pass
+    
+    @abstractmethod
+    def query_in_grad(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module,
+        cache: dict,
+    ):
+        pass
+    
+    @abstractmethod
+    def key_in_grad(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module,
+        cache: dict,
+    ):
+        pass
+    
+    @abstractmethod
+    def value_in_grad(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module,
+        cache: dict,
+    ):
+        pass
+
+    # gradient helpers
+    @abstractmethod
+    def _compute_headwise_attn_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        W_linear: torch.Tensor,
+        norm: nn.Module,
+        rot_embeds: torch.Tensor = None,
     ):
         pass
 
@@ -164,47 +208,6 @@ class ModelAdapter(ABC):
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         norm: nn.Module,
-    ):
-        pass
-    
-    @abstractmethod
-    def compute_headwise_query_input_gradient(
-        self,
-        grad: torch.Tensor,
-        x_pre_norm: torch.Tensor,
-        layer: nn.Module,
-        cache: dict,
-    ):
-        pass
-    
-    @abstractmethod
-    def compute_headwise_key_input_gradient(
-        self,
-        grad: torch.Tensor,
-        x_pre_norm: torch.Tensor,
-        layer: nn.Module,
-        cache: dict,
-    ):
-        pass
-    
-    @abstractmethod
-    def compute_headwise_value_input_gradient(
-        self,
-        grad: torch.Tensor,
-        x_pre_norm: torch.Tensor,
-        layer: nn.Module,
-        cache: dict,
-    ):
-        pass
-
-    @abstractmethod
-    def _compute_headwise_attn_gradient(
-        self,
-        grad: torch.Tensor,
-        x_pre_norm: torch.Tensor,
-        W_linear: torch.Tensor,
-        norm: nn.Module,
-        rot_embeds: torch.Tensor = None,
     ):
         pass
 
@@ -244,108 +247,83 @@ class Llama2ModelAdapter(ModelAdapter):
         return self.config.head_dim
 
     @property
-    def embed_tokens(self) -> nn.Module:
+    def emb(self) -> nn.Module:
         return self.model.model.embed_tokens
-
-    @property
-    def rotary_emb(self):
-        return self.model.model.rotary_emb
 
     @property
     def layers(self) -> nn.Module:
         return self.model.model.layers
     
-    @property
-    def lm_head(self):
-        return self.model.lm_head
+    # embeddings
+    def emb_in(self) -> torch.Tensor:
+        return self.model.model.embed_tokens.input
 
-    def ln_1(self, layer: nn.Module):
-        return layer.input_layernorm
+    def emb_out(self) -> torch.Tensor:
+        return self.model.model.embed_tokens.output
 
+    def rotary_emb_out(self):
+        rot_cos, rot_sin = self.model.model.rotary_emb.output
+        return (rot_cos.detach(), rot_sin.detach())
 
-    def build_attn_source(self, layer):
+    # residual positions
+    def residual_in(self, layer: nn.Module) -> torch.Tensor:
+        return layer.input_layernorm.input
+
+    def residual_mid(self, layer: nn.Module) -> torch.Tensor:
+        return layer.post_attention_layernorm.input
+
+    def residual_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.output
+
+    # attention helpers
+    def build_attn_source(self, layer: nn.Module) -> None:
         layer.self_attn.source
 
-    def q_proj_out(self, layer: nn.Module):
+    # attention
+    def query_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.self_attn.q_proj.output
-    
-    def q_proj_weights(self, layer: nn.Module):
-        return layer.self_attn.q_proj.weight.data
 
-    def k_proj_out(self, layer: nn.Module):
+    def key_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.self_attn.source.attention_interface_0.source.repeat_kv_0.output
-    
-    def k_proj_weights(self, layer: nn.Module):
-        return layer.self_attn.k_proj.weight.data
 
-    def v_proj_out(self, layer: nn.Module):
+    def value_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.self_attn.source.attention_interface_0.source.repeat_kv_1.output
-    
-    def v_proj_weights(self, layer: nn.Module):
-        return layer.self_attn.v_proj.weight.data
-    
-    def attn_interface(self, layer: nn.Module):
-        return layer.self_attn.source.attention_interface_0
 
-    def o_proj_weights(self, layer: nn.Module):
-        return layer.self_attn.o_proj.weight.data
-
-
-    def ln_2(self, layer: nn.Module):
-        return layer.post_attention_layernorm
-
-    def mlp(self, layer: nn.Module):
-        return layer.mlp
-
-
-    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
+    @torch.no_grad() 
+    def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
+        z = layer.self_attn.source.attention_interface_0.output[0].detach()
         _, _, H, d = z.shape
-        W_linear = self.o_proj_weights(layer)
+
+        W_linear = layer.self_attn.o_proj.weight.data
         W_linear = W_linear.T.reshape(H, d, -1).detach()
         return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
 
-    def compute_mlp_input_gradient(
+    # mlp
+    def mlp_in(self, layer: nn.Module) -> torch.Tensor:
+        return layer.mlp.input
+
+    def mlp_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.mlp.output
+
+    # logits
+    def logits(self):
+        return self.model.lm_head.output
+    
+
+    # graients 
+    def mlp_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         layer: nn.Module
     ):
         return self._compute_norm_input_gradient(
-            grad=grad, x_pre_norm=x_pre_norm, norm=self.ln_2(layer)
+            grad=grad,
+            x_pre_norm=x_pre_norm, 
+            norm=layer.post_attention_layernorm
         )
-
-    @torch.no_grad() 
-    def _compute_norm_input_gradient(
-        self,
-        grad: torch.Tensor,
-        x_pre_norm: torch.Tensor,
-        norm: nn.Module,
-    ):
-        if self.ignore_norm == True:
-            return grad
-
-        input_dtype = grad.dtype
-        x_pre_norm = x_pre_norm.float()
-
-        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
-            x_pre_norm = x_pre_norm.unsqueeze(1)
-
-        variance = (x_pre_norm ** 2).mean(dim=-1, keepdim=True)
-        sigma = torch.sqrt(variance + norm.variance_epsilon)
-        
-        u = (grad * norm.weight.data).float()
-        
-        if self.frozen_norm == True:
-            grad_pre_norm =  u / sigma
-        
-        else:
-            u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
-            term2 = (u_dot_x / (self.model_dim * (variance + norm.variance_epsilon))) * x_pre_norm
-            grad_pre_norm = (u - term2) / sigma
-        
-        return grad_pre_norm.to(input_dtype)
     
-    def compute_headwise_query_input_gradient(
+    def query_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
@@ -355,10 +333,13 @@ class Llama2ModelAdapter(ModelAdapter):
         B, S, _ = grad.shape
         grad = grad.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         return self._compute_headwise_attn_gradient(  # does not require inverse rot_embeds as cached at linear out
-            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.q_proj_weights(layer), norm=self.ln_1(layer)
+            grad=grad, 
+            x_pre_norm=x_pre_norm, 
+            W_linear=layer.self_attn.q_proj.weight.data, 
+            norm=layer.input_layernorm
         )
     
-    def compute_headwise_key_input_gradient(
+    def key_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
@@ -366,10 +347,14 @@ class Llama2ModelAdapter(ModelAdapter):
         cache: dict,
     ):
         return self._compute_headwise_attn_gradient(
-            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.k_proj_weights(layer), norm=self.ln_1(layer), rot_embeds=cache['rotary_emb']
+            grad=grad, 
+            x_pre_norm=x_pre_norm, 
+            W_linear=layer.self_attn.k_proj.weight.data,
+            norm=layer.input_layernorm, 
+            rot_embeds=cache['rotary_emb']
         )
     
-    def compute_headwise_value_input_gradient(
+    def value_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
@@ -377,8 +362,46 @@ class Llama2ModelAdapter(ModelAdapter):
         cache: dict,
     ):
         return self._compute_headwise_attn_gradient( 
-            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.v_proj_weights(layer), norm=self.ln_1(layer)
+            grad=grad, 
+            x_pre_norm=x_pre_norm, 
+            W_linear=layer.self_attn.v_proj.weight.data,
+            norm=layer.input_layernorm,
         )
+
+    # gradient helpers
+    @torch.no_grad() 
+    def _compute_norm_input_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        norm: nn.Module,
+    ):
+        input_dtype = grad.dtype
+        x_pre_norm = x_pre_norm.float()
+
+        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
+            x_pre_norm = x_pre_norm.unsqueeze(1)
+
+        u = (grad * norm.weight.data).float()
+
+        # ignore all scaling and centering
+        if self.ignore_norm:
+            return u.to(input_dtype)
+
+        variance = (x_pre_norm ** 2).mean(dim=-1, keepdim=True)
+        sigma = torch.sqrt(variance + norm.variance_epsilon)
+        
+        # treat rms as detached adjoint transformation
+        if self.frozen_norm == True:
+            grad_pre_norm =  u / sigma
+            return grad_pre_norm.to(input_dtype)
+        
+        # complete gradient through rms term
+        u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
+        term2 = (u_dot_x / (self.model_dim * (variance + norm.variance_epsilon))) * x_pre_norm
+        grad_pre_norm = (u - term2) / sigma
+        
+        return grad_pre_norm.to(input_dtype)
 
     @torch.no_grad() 
     def _compute_headwise_attn_gradient(
@@ -407,35 +430,45 @@ class Llama2ModelAdapter(ModelAdapter):
     
 
 
-
-
 # ------------------------------------------------------------------
 # Gemma2 
 # ------------------------------------------------------------------
 
 class Gemma2ModelAdapter(Llama2ModelAdapter):
 
-    def ln_2(self, layer: nn.Module):
-        return layer.pre_feedforward_layernorm
+    # gemma has pre and post module layer norm
+    def residual_mid(self, layer: nn.Module) -> torch.Tensor:
+        return layer.pre_feedforward_layernorm.input
 
-    def mlp(self, layer: nn.Module):
-        return layer.post_feedforward_layernorm
-    
-    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
+    @torch.no_grad() 
+    def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
+        z = layer.self_attn.source.attention_interface_0.output[0].detach()
         _, _, H, d = z.shape
-        W_linear = self.o_proj_weights(layer)
+
+        W_linear = layer.self_attn.o_proj.weight.data
         W_linear = W_linear.T.reshape(H, d, -1).detach()
+        per_head_attn_out = torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
 
-        per_head_attn_out = torch.einsum('BSHd, HdD -> HBSD', z, W_linear).float()
+        # pass through norm
+        # TODO: consider ignoring scaling when ignore_norm
+        return layer.post_attention_layernorm(per_head_attn_out)
 
-        eps = layer.post_attention_layernorm.eps
-        norm_weight = layer.post_attention_layernorm.weight
-        norm_scalar = torch.rsqrt(per_head_attn_out.sum(dim=0).pow(2).mean(-1, keepdim=True) + eps)
-
-        result = per_head_attn_out * norm_scalar * (1.0 + norm_weight.float())
-
-        return result.to(z.dtype)
+    # mlp
+    def mlp_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.post_feedforward_layernorm.output
     
+    # graients 
+    def mlp_in_grad(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        layer: nn.Module
+    ):
+        return self._compute_norm_input_gradient(
+            grad=grad,
+            x_pre_norm=x_pre_norm, 
+            norm=layer.pre_feedforward_layernorm
+        )
 
     @torch.no_grad() 
     def _compute_norm_input_gradient(
@@ -444,34 +477,32 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
         x_pre_norm: torch.Tensor,
         norm: nn.Module,
     ):
-        if self.ignore_norm == True:
-            return grad
-        
         input_dtype = grad.dtype
-        grad = grad.float()
         x_pre_norm = x_pre_norm.float()
 
         if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
             x_pre_norm = x_pre_norm.unsqueeze(1)
 
+        u = grad.float() * (1 + norm.weight.data.float())
+
+        # ignore all scaling and centering
+        if self.ignore_norm:
+            return u.to(input_dtype)
+
         variance = (x_pre_norm ** 2).mean(dim=-1, keepdim=True)
         sigma = torch.sqrt(variance + norm.eps)
         
-        u = grad * norm.weight.data.float()
-
+        # treat rms as detached adjoint transformation
         if self.frozen_norm == True:
-            grad_pre_norm = u / sigma
-
-        else:
-            u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
-            
-            term2 = (u_dot_x / (self.model_dim * (variance + norm.eps))) * x_pre_norm
-            grad_pre_norm = (u - term2) / sigma
+            grad_pre_norm =  u / sigma
+            return grad_pre_norm.to(input_dtype)
+        
+        # complete gradient through rms term
+        u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
+        term2 = (u_dot_x / (self.model_dim * (variance + norm.eps))) * x_pre_norm
+        grad_pre_norm = (u - term2) / sigma
         
         return grad_pre_norm.to(input_dtype)
-
-    
-
 
 
 
@@ -480,11 +511,11 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
 # ------------------------------------------------------------------
 
 class GPT2ModelAdapter(ModelAdapter):
-
+    
     @property
     def uses_rotary_emb(self):
         return False
-    
+
     @property
     def n_layers(self):
         return self.config.n_layer
@@ -500,109 +531,81 @@ class GPT2ModelAdapter(ModelAdapter):
     @property
     def head_dim(self):
         return self.model_dim // self.n_heads
-
+    
     @property
-    def embed_tokens(self) -> nn.Module:
+    def emb(self) -> nn.Module:
         return self.model.transformer.wte
-
+    
     @property
     def layers(self) -> nn.Module:
         return self.model.transformer.h
     
-    @property
-    def lm_head(self):
-        return self.model.lm_head
+    # embeddings
+    def emb_in(self) -> torch.Tensor:
+        return self.model.transformer.wte.input
 
-    def ln_1(self, layer: nn.Module):
-        return layer.ln_1
+    def emb_out(self) -> torch.Tensor:
+        return self.model.transformer.wte.output
 
-    def build_attn_source(self, layer):
+    # residual positions
+    def residual_in(self, layer: nn.Module) -> torch.Tensor:
+        return layer.ln_1.input
+
+    def residual_mid(self, layer: nn.Module) -> torch.Tensor:
+        return layer.ln_2.input
+
+    def residual_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.output
+
+    # attention helpers
+    def build_attn_source(self, layer: nn.Module) -> None:
         layer.attn.source
 
-    def q_proj_out(self, layer: nn.Module):
+    # attention
+    def query_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.attn.source.split_1.output[0]
-    
-    def q_proj_weights(self, layer: nn.Module):
-        return layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 0, :]
 
-    def k_proj_out(self, layer: nn.Module):
+    def key_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.attn.source.transpose_2.output
-    
-    def k_proj_weights(self, layer: nn.Module):
-        return layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 1, :]
 
-    def v_proj_out(self, layer: nn.Module):
+    def value_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.attn.source.transpose_3.output
-    
-    def v_proj_weights(self, layer: nn.Module):
-        return layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 2, :]
-    
-    def attn_interface(self, layer: nn.Module):
-        return layer.attn.source.attention_interface_0
 
-    def o_proj_weights(self, layer: nn.Module):
-        return layer.attn.c_proj.weight.data
-
-    def ln_2(self, layer: nn.Module):
-        return layer.ln_2
-
-    def mlp(self, layer: nn.Module):
-        return layer.mlp
-    
-    def compute_per_head_attn_out(self, z: torch.Tensor, layer: nn.Module) -> torch.Tensor:
+    @torch.no_grad() 
+    def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
+        z = layer.attn.source.attention_interface_0.output[0].detach()
         _, _, H, d = z.shape
-        W_linear = self.o_proj_weights(layer)
+
+        W_linear = layer.attn.c_proj.weight.data
         # Conv_1D stores weights in (n_in, n_out)
         W_linear = W_linear.reshape(H, d, -1).detach()
         return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
 
-    def compute_mlp_input_gradient(
+    # mlp
+    def mlp_in(self, layer: nn.Module) -> torch.Tensor:
+        return layer.mlp.input
+
+    def mlp_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.mlp.output
+
+    # logits
+    def logits(self):
+        return self.model.lm_head.output 
+
+    # graients 
+    def mlp_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         layer: nn.Module
     ):
         return self._compute_norm_input_gradient(
-            grad=grad, x_pre_norm=x_pre_norm, norm=self.ln_2(layer)
+            grad=grad,
+            x_pre_norm=x_pre_norm, 
+            norm=layer.ln_2
         )
-
-    @torch.no_grad() 
-    def _compute_norm_input_gradient(
-        self,
-        grad: torch.Tensor,
-        x_pre_norm: torch.Tensor,
-        norm: nn.Module,
-    ):
-
-        input_dtype = grad.dtype
-        x_pre_norm = x_pre_norm.float()
-
-        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
-            x_pre_norm = x_pre_norm.unsqueeze(1)
-
-        mean = x_pre_norm.mean(dim=-1, keepdim=True)
-        x_centered = x_pre_norm - mean
-
-        variance = (x_centered ** 2).mean(dim=-1, keepdim=True)
-        sigma = torch.sqrt(variance + norm.eps)
-        
-        u = (grad * norm.weight.data).float()
-
-        if self.ignore_norm == True:
-            return u
-        
-        if self.frozen_norm == True: # subtract x.mean() to fully linearize norm transformation
-            grad_pre_norm = (u - mean) / sigma
-            
-        else:
-            u_mean = u.mean(dim=-1, keepdim=True)
-            u_dot_xc = (u * x_centered).sum(dim=-1, keepdim=True)
-            term2 = (u_dot_xc / (self.model_dim * (variance + norm.eps))) * x_centered
-            grad_pre_norm = (u - u_mean - term2) / sigma
-        
-        return grad_pre_norm.to(input_dtype)
     
-    def compute_headwise_query_input_gradient(
+    def query_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
@@ -612,10 +615,13 @@ class GPT2ModelAdapter(ModelAdapter):
         B, S, _ = grad.shape
         grad = grad.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         return self._compute_headwise_attn_gradient(
-            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.q_proj_weights(layer), norm=self.ln_1(layer)
+            grad=grad, 
+            x_pre_norm=x_pre_norm, 
+            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 0, :],
+            norm=layer.ln_1
         )
     
-    def compute_headwise_key_input_gradient(
+    def key_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
@@ -623,10 +629,13 @@ class GPT2ModelAdapter(ModelAdapter):
         cache: dict,
     ):
         return self._compute_headwise_attn_gradient(
-            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.k_proj_weights(layer), norm=self.ln_1(layer)
+            grad=grad, 
+            x_pre_norm=x_pre_norm, 
+            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 1, :],
+            norm=layer.ln_1
         )
     
-    def compute_headwise_value_input_gradient(
+    def value_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
@@ -634,8 +643,50 @@ class GPT2ModelAdapter(ModelAdapter):
         cache: dict,
     ):
         return self._compute_headwise_attn_gradient( 
-            grad=grad, x_pre_norm=x_pre_norm, W_linear=self.v_proj_weights(layer), norm=self.ln_1(layer)
+            grad=grad, 
+            x_pre_norm=x_pre_norm, 
+            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 2, :], 
+            norm=layer.ln_1
         )
+
+    
+    # gradient helpers
+    @torch.no_grad() 
+    def _compute_norm_input_gradient(
+        self,
+        grad: torch.Tensor,
+        x_pre_norm: torch.Tensor,
+        norm: nn.Module,
+    ):
+        input_dtype = grad.dtype
+        x_pre_norm = x_pre_norm.float()
+
+        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
+            x_pre_norm = x_pre_norm.unsqueeze(1)
+
+        u = grad.float() * norm.weight.data.float()
+
+        # ignore all scaling and centering
+        if self.ignore_norm:
+            return u.to(input_dtype)
+
+        mean = x_pre_norm.mean(dim=-1, keepdim=True)
+        x_centered = x_pre_norm - mean
+        variance = (x_centered ** 2).mean(dim=-1, keepdim=True)
+        sigma = torch.sqrt(variance + norm.eps)
+
+        # treat layernorm as detached adjoint transformation
+        if self.frozen_norm == True:
+            grad_pre_norm =  u / sigma
+            return grad_pre_norm.to(input_dtype)
+
+        # complete gradient through layernorm
+        u_mean = u.mean(dim=-1, keepdim=True)
+        u_dot_xc = (u * x_centered).sum(dim=-1, keepdim=True)
+        term2 = (u_dot_xc / (self.model_dim * (variance + norm.eps))) * x_centered
+        grad_pre_norm = (u - u_mean - term2) / sigma
+        
+        return grad_pre_norm.to(input_dtype)
 
     @torch.no_grad() 
     def _compute_headwise_attn_gradient(
@@ -645,7 +696,7 @@ class GPT2ModelAdapter(ModelAdapter):
         W_linear: torch.Tensor,
         norm: nn.Module,
         rot_embeds: torch.Tensor = None,
-    ):
+    ):  
         # STEP 1: Backprop through the projection
         W_linear = W_linear.T.reshape(-1, self.head_dim, self.model_dim)  # Conv_1D stores weights in (n_in, n_out)
         grad_post_norm = torch.einsum('bhsd, hdD -> bhsD', grad, W_linear)
@@ -654,3 +705,4 @@ class GPT2ModelAdapter(ModelAdapter):
         grad_pre_norm = self._compute_norm_input_gradient(grad_post_norm, x_pre_norm, norm)
         
         return grad_pre_norm.transpose(0, 1)
+        
