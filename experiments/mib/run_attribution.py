@@ -18,6 +18,7 @@ import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from nnsight import NNsight
 
 from experiments.mib.data_utils import MIBDataset, create_mib_circuit
 from linear_transformer import patch_model_for_lvp
@@ -121,7 +122,6 @@ def parse_args() -> argparse.Namespace:
         "--attn-softcap-fn", default="tanh",
         help="Gemma2 logit softcap rule (Rule 2). Key into ACT_FN.",
     )
-
     parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
     )
@@ -140,6 +140,8 @@ def _load_model_components(
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
+    if model_name == 'gpt2':
+        tokenizer.padding_side = "right" # positional embeddings dont like left embedding
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
 
