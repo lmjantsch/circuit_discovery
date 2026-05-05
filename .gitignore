@@ -1,5 +1,11 @@
 # Ignored Folders
 circuits/
-results/
+*results/
 .vscode/
 __pycache__/
+plots/
+scripts/
+
+
+# Files
+.logg
