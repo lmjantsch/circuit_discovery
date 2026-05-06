@@ -10,7 +10,8 @@ from tracer.model_adapters import ModelAdapter
 
 class EdgeCircuitTracer:
 
-    def __init__(self, adapter: ModelAdapter, tokenizer: AutoTokenizer, cache_device: torch.device | None = None, return_variance: bool = True):
+    def __init__(self, adapter: ModelAdapter, tokenizer: AutoTokenizer, cache_device: torch.device | None = None, return_variance: bool = True, 
+                 q_weight: float = 1.0, k_weight: float = 1.0, v_weight: float = 1.0, gate_weight: float = 1.0, up_weight: float = 1.0, scale_loc: str = 'post'):
         self.adapter = adapter
         self.model = adapter.model
         self.tokenizer = tokenizer
@@ -20,6 +21,13 @@ class EdgeCircuitTracer:
             self.cache_device = adapter.device
 
         self.return_variance = return_variance
+
+        self.q_weight = q_weight
+        self.k_weight = k_weight
+        self.v_weight = v_weight
+        self.gate_weight = gate_weight
+        self.up_weight = up_weight
+        self.scale_loc = scale_loc
         
         self.circuit_scores = None
         self.circuit_scores_m2 = None
@@ -162,7 +170,8 @@ class EdgeCircuitTracer:
 
             self.cache[layer_id]['mid'] = self.adapter.residual_mid(layer).detach()
 
-            self.cache[layer_id]['mlp_in'] = self.adapter.mlp_in(layer)
+            self.cache[layer_id]['gate_out'] = self.adapter.gate_out(layer)
+            self.cache[layer_id]['up_out'] = self.adapter.up_out(layer)
             self._update_source_2d_cache(
                 self.adapter.mlp_out(layer).detach().reshape(1, self.BSD), type='mlp', layer_id=layer_id)
 
@@ -194,46 +203,42 @@ class EdgeCircuitTracer:
                 layer = self.adapter.layers[layer_id]
                 layer_input = self.cache[layer_id - 1]['out'].detach()
 
+                up_grad = self._scale_and_detach_grad(self.cache[layer_id]['up_out'], self.up_weight, scale_loc=self.scale_loc)
+                gate_grad = self._scale_and_detach_grad(self.cache[layer_id]['gate_out'], self.gate_weight, scale_loc=self.scale_loc)
+
                 mlp_in_grad_pre_norm = self.adapter.mlp_in_grad(
-                    grad=self.cache[layer_id]['mlp_in'].grad.detach(),
+                    gate_grad=gate_grad, up_grad=up_grad,
                     x_pre_norm=self.cache[layer_id]['mid'],
                     layer=layer
                 ).reshape(1, self.BSD)
                 self._update_scores(mlp_in_grad_pre_norm, type='mlp', layer_id=layer_id)
                 del mlp_in_grad_pre_norm
                 
+
+                v_grad = self._scale_and_detach_grad(self.cache[layer_id]['value_out'], self.v_weight, scale_loc=self.scale_loc)
+
                 v_proj_in_grad_pre_norm = self.adapter.value_in_grad(
-                    grad=self.cache[layer_id]['value_out'].grad.detach(),
-                    x_pre_norm=layer_input, layer=layer, cache=self.cache
+                    grad=v_grad, x_pre_norm=layer_input, layer=layer, cache=self.cache
                 ).reshape(self.adapter.n_heads, self.BSD)
                 self._update_scores(v_proj_in_grad_pre_norm, type='attn_v', layer_id=layer_id)
                 del v_proj_in_grad_pre_norm
 
-                #grad_norms = torch.norm(self.cache[layer_id]['key_out'].grad, dim=-1, keepdim=True)
-                # scale = 0.2 / torch.clamp_min(grad_norms, 0.2)
-                # self.cache[layer_id]['key_out'].grad = scale * self.cache[layer_id]['key_out'].grad
+                
+                k_grad = self._scale_and_detach_grad(self.cache[layer_id]['key_out'], self.k_weight, scale_loc=self.scale_loc)
                 
                 k_proj_in_grad_pre_norm = self.adapter.key_in_grad(
-                    grad=self.cache[layer_id]['key_out'].grad.detach(),
-                    x_pre_norm=layer_input, layer=layer, cache=self.cache
+                    grad=k_grad, x_pre_norm=layer_input, layer=layer, cache=self.cache
                 ).reshape(self.adapter.n_heads, self.BSD)
                 self._update_scores(k_proj_in_grad_pre_norm, type='attn_k', layer_id=layer_id)
-                
-                grad_norms = torch.norm(self.cache[layer_id]['key_out'].grad, dim=1)
-
-                self.cache[layer_id]['key_out'].grad = self.cache[layer_id]['key_out'].grad *0.0
-                
-                print('k_grad_norms', grad_norms.mean(), grad_norms.max())
                 del k_proj_in_grad_pre_norm
 
+
+                q_grad = self._scale_and_detach_grad(self.cache[layer_id]['query_out'], self.q_weight, scale_loc=self.scale_loc)
+
                 q_proj_in_grad_pre_norm = self.adapter.query_in_grad(
-                      grad=self.cache[layer_id]['query_out'].grad.detach(),
-                    x_pre_norm=layer_input, layer=layer, cache=self.cache
+                    grad=q_grad, x_pre_norm=layer_input, layer=layer, cache=self.cache
                 ).reshape(self.adapter.n_heads, self.BSD)
                 self._update_scores(q_proj_in_grad_pre_norm, type='attn_q', layer_id=layer_id)
-                # self.cache[layer_id]['query_out'].grad = self.cache[layer_id]['query_out'].grad * 0.0
-                grad_norms = torch.norm(self.cache[layer_id]['query_out'].grad, dim=1)
-                print('q_grad_norms', grad_norms.mean(), grad_norms.max())
                 del q_proj_in_grad_pre_norm
     
     def _update_scores(self, grad: torch.Tensor, type: str, layer_id: int = None):
@@ -261,3 +266,18 @@ class EdgeCircuitTracer:
             # Chan's algorithm for batched M2 update: M2_total = M2_prev + M2_batch + delta² * n_prev*n_new / n_total
             batch_m2_weight = (self.num_processed_samples - self.curr_batch_size) * self.curr_batch_size / self.num_processed_samples
             self.circuit_scores_m2[src_slice, tgt_slice] += batch_m2 + (batch_scores_mean_delta ** 2) * batch_m2_weight
+
+    def _scale_and_detach_grad(self, grad_tensor: torch.Tensor, weight: float, scale_loc: str = 'post'):
+        if grad_tensor == None: # handle GPT2 missing gate tensor
+            return None
+
+        if scale_loc == 'pre':
+            grad_tensor.grad = weight * grad_tensor.grad
+
+        detached_grad = grad_tensor.grad.detach()
+
+        if scale_loc == 'post':
+            grad_tensor.grad = weight * grad_tensor.grad
+            
+        return detached_grad
+        

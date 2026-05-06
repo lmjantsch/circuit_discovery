@@ -123,6 +123,16 @@ def parse_args() -> argparse.Namespace:
         help="Gemma2 logit softcap rule (Rule 2). Key into ACT_FN.",
     )
     parser.add_argument(
+        '--weights',
+        type=float,
+        nargs=5,
+        default=[1.0, 1.0, 1.0, 1.0, 1.0],
+        help='Provide exactly 5 float values (q_weight, k_weight, v_weight, gate_weight, up_weight)'
+    )
+    parser.add_argument(
+        '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post'], default='post'
+    )
+    parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
     )
     return parser.parse_args()
@@ -153,7 +163,12 @@ def _load_model_components(
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
     adapter = adapter_cls(model, frozen_norm = lvp_kwargs['frozen_norm'], ignore_norm=args.ignore_norm)
-    tracer = EdgeCircuitTracer(adapter, tokenizer)
+    tracer = EdgeCircuitTracer(
+        adapter, tokenizer,
+        q_weight=args.weights[0], k_weight=args.weights[1], v_weight=args.weights[2],
+        gate_weight=args.weights[3], up_weight=args.weights[4],
+        scale_loc=args.scale_loc
+    )
     return tokenizer, adapter, tracer
 
 
@@ -221,7 +236,7 @@ def run() -> None:
             json.dump(circuit, f, indent=2)
         torch.save(scores, os.path.join(circuit_dir, 'scores.pt'))
         if variance != None:
-            torch.save(variance, os.path.join(circuit, 'variance.pt'))
+            torch.save(variance, os.path.join(circuit_dir, 'variance.pt'))
          
         logger.info("  Done in %.1fs — saved %s", time.time() - t0, circuit_dir)
 

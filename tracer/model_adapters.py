@@ -137,7 +137,11 @@ class ModelAdapter(ABC):
 
     # mlp
     @abstractmethod
-    def mlp_in(self, layer: nn.Module) -> torch.Tensor:
+    def gate_out(self, layer: nn.Module) -> torch.Tensor:
+        pass
+
+    @abstractmethod
+    def up_out(self, layer: nn.Module) -> torch.Tensor:
         pass
 
     @abstractmethod
@@ -154,7 +158,8 @@ class ModelAdapter(ABC):
     @abstractmethod
     def mlp_in_grad(
         self,
-        grad: torch.Tensor,
+        gate_grad: torch.Tensor,
+        up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         layer: nn.Module
     ):
@@ -299,8 +304,11 @@ class Llama2ModelAdapter(ModelAdapter):
         return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
 
     # mlp
-    def mlp_in(self, layer: nn.Module) -> torch.Tensor:
-        return layer.mlp.input
+    def gate_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.mlp.gate_proj.output
+
+    def up_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.mlp.up_proj.output
 
     def mlp_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.mlp.output
@@ -313,10 +321,21 @@ class Llama2ModelAdapter(ModelAdapter):
     # graients 
     def mlp_in_grad(
         self,
-        grad: torch.Tensor,
+        gate_grad: torch.Tensor,
+        up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         layer: nn.Module
     ):
+        
+        # STEP 1: Backprop through the projection
+        W_gate_linear = layer.mlp.gate_proj.weight.data
+        gate_grad_post_norm = torch.einsum('bsd, dD -> bsD', gate_grad, W_gate_linear)
+
+        W_up_linear = layer.mlp.up_proj.weight.data
+        up_grad_post_norm = torch.einsum('bsd, dD -> bsD', up_grad, W_up_linear)
+
+        grad = gate_grad_post_norm + up_grad_post_norm
+
         return self._compute_norm_input_gradient(
             grad=grad,
             x_pre_norm=x_pre_norm, 
@@ -447,23 +466,48 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
 
         W_linear = layer.self_attn.o_proj.weight.data
         W_linear = W_linear.T.reshape(H, d, -1).detach()
-        per_head_attn_out = torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
+        per_head_attn_out = torch.einsum('BSHd, HdD -> HBSD', z, W_linear).float()
 
         # pass through norm
-        # TODO: consider ignoring scaling when ignore_norm
-        return layer.post_attention_layernorm(per_head_attn_out)
+        W_norm = layer.post_attention_layernorm.weight.data
+        eps = layer.post_attention_layernorm.eps
+
+        rms_scalar = torch.rsqrt(per_head_attn_out.sum(0).pow(2).mean(-1, keepdim=True) + eps)
+        per_head_attn_out = per_head_attn_out * rms_scalar
+        per_head_attn_out = per_head_attn_out * (1.0 + W_norm.float())
+
+        return per_head_attn_out.to(z.dtype)
 
     # mlp
     def mlp_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.post_feedforward_layernorm.output
-    
-    # graients 
+
+    # logits
+    def logits(self):
+        raw = self.model.lm_head.output
+        cap = getattr(self.config, 'final_logit_softcapping', None)
+        if cap is not None:
+            return torch.tanh(raw / cap) * cap
+        return raw
+
+    # graients
     def mlp_in_grad(
         self,
-        grad: torch.Tensor,
+        gate_grad: torch.Tensor,
+        up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         layer: nn.Module
     ):
+        
+        # STEP 1: Backprop through the projection
+        W_gate_linear = layer.mlp.gate_proj.weight.data
+        gate_grad_post_norm = torch.einsum('bsd, dD -> bsD', gate_grad, W_gate_linear)
+
+        W_up_linear = layer.mlp.up_proj.weight.data
+        up_grad_post_norm = torch.einsum('bsd, dD -> bsD', up_grad, W_up_linear)
+
+        grad = gate_grad_post_norm + up_grad_post_norm
+
         return self._compute_norm_input_gradient(
             grad=grad,
             x_pre_norm=x_pre_norm, 
@@ -582,6 +626,12 @@ class GPT2ModelAdapter(ModelAdapter):
         return torch.einsum('BSHd, HdD -> HBSD', z, W_linear)
 
     # mlp
+    def gate_out(self, layer: nn.Module) -> torch.Tensor:
+        return None
+
+    def up_out(self, layer: nn.Module) -> torch.Tensor:
+        return layer.mlp.c_fc.output
+
     def mlp_in(self, layer: nn.Module) -> torch.Tensor:
         return layer.mlp.input
 
@@ -595,10 +645,15 @@ class GPT2ModelAdapter(ModelAdapter):
     # graients 
     def mlp_in_grad(
         self,
-        grad: torch.Tensor,
+        gate_grad: torch.Tensor,
+        up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
         layer: nn.Module
-    ):
+    ):  
+        # STEP 1: Backprop through the projection
+        W_up_linear = layer.mlp.c_fc.weight.data
+        grad = torch.einsum('bsd, Dd -> bsD', up_grad, W_up_linear) # -> weights have shape (input, output)
+
         return self._compute_norm_input_gradient(
             grad=grad,
             x_pre_norm=x_pre_norm, 

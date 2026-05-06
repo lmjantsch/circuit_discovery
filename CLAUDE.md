@@ -121,20 +121,26 @@ The custom DPA implementation in `experiments/mib/run_attribution.py` uses backw
 
 ### CircuitTracer (`tracer/`)
 
-A standalone nnsight-based circuit tracer. Entry point is `CircuitTracer.__call__(batch)` where `batch = (clean_prompt, _, clean_targets, corrupt_targets)`.
+A standalone nnsight-based circuit tracer. Entry point is `EdgeCircuitTracer.build_circuit(dataloader)`.
 
 | File | Purpose |
 |------|---------|
-| `tracer/tracer.py` | `CircuitTracer` — forward cache + backward scoring loop |
-| `tracer/backend.py` | `compute_rmsnorm_input_gradients`, `compute_headwise_input_gradients` — gradient backprop through RMSNorm and linear projections (with optional inverse RoPE) |
-| `tracer/modeling_utils.py` | `per_head_attn_out` — splits attention output by head via `o_proj`; `apply_inverse_rope` — undoes RoPE for k/q grad backprop |
+| `tracer/tracer.py` | `EdgeCircuitTracer` — forward cache + backward scoring loop |
+| `tracer/model_adapters.py` | `ModelAdapter` subclasses — model-specific forward/backward hooks for Llama2/Qwen2.5, Gemma2, GPT2 |
 
 **Score matrix layout** (`circuit_scores` shape `[source_dims, grad_dims]`):
 
 - `source_dims = 1 + n_layers * (n_heads + 1)` — embedding (1) + per-layer: heads (n_heads) then MLP (1)
 - `grad_dims = n_layers * (3 * n_heads + 1) + 1` — per-layer: q/k/v heads (3×n_heads) then MLP (1), plus lm_head (1)
 
-**Assumptions**: Qwen2.5-style architecture — `model.model.embed_tokens`, `model.model.rotary_emb`, `model.model.layers[i]` with `.self_attn`, `.mlp`, `.input_layernorm`, `.post_attention_layernorm`. GQA is handled in `compute_headwise_input_gradients` via `repeat_interleave`.
+**Attribution score weighting**: `EdgeCircuitTracer` accepts per-projection scalar weights (`q_weight`, `k_weight`, `v_weight`, `gate_weight`, `up_weight`, all default `1.0`) and a `scale_loc` parameter (`'pre'` or `'post'`, default `'post'`).
+
+- `scale_loc='pre'`: weight is applied to the detached gradient before computing `source · grad`. Scales the attribution score for that projection.
+- `scale_loc='post'`: weight is applied to `grad_tensor.grad` *after* detaching. The returned gradient is unscaled, so the current attribution score is unaffected; downstream nnsight gradient propagation is scaled instead.
+
+These are passed via `--weights q k v gate up` and `--scale-loc` in `run_attribution.py`.
+
+**Assumptions**: Qwen2.5-style architecture — `model.model.embed_tokens`, `model.model.rotary_emb`, `model.model.layers[i]` with `.self_attn`, `.mlp`, `.input_layernorm`, `.post_attention_layernorm`. GQA is handled via `repeat_interleave` in `Llama2ModelAdapter`.
 
 ## Testing
 
