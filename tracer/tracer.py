@@ -281,3 +281,11 @@ class EdgeCircuitTracer:
             
         return detached_grad
         
+# # ioi, mcqa / qwen, gemma
+# # ioi gpt
+# # eap+FrozenNorm+Scaling
+# 0.0 0.05 0.1 0.2 0.5 1.0 1.5 3.0
+# 0.0 0.05 0.1 0.2 0.5 1.0 1.5 3.0
+# 0.0 0.05 0.1 0.2 0.5 1.0 1.5 3.0
+# 0.0 0.05 0.1 0.2 0.5 1.0 1.5 3.0
+# 0.0 0.05 0.1 0.2 0.5 1.0 1.5 3.0

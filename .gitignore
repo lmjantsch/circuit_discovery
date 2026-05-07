@@ -5,6 +5,9 @@ circuits/
 __pycache__/
 plots/
 scripts/
+grid_search/
+_grid_search/
+grid_search_dryrun/
 
 
 # Files
