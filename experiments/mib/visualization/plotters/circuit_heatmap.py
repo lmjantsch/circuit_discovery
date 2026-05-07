@@ -6,6 +6,7 @@ from matplotlib.figure import Figure
 
 from experiments.mib.visualization.visualization import Plotter
 from experiments.mib.visualization.utils import (
+    apply_top_percent_mask,
     infer_model_dims,
     load_metric,
     save_figure,
@@ -24,11 +25,27 @@ class CircuitHeatmap(Plotter):
                         print(f"No data for: {method}, {task}, {model}. Skipping...")
                         continue
 
-                    n_layers, n_heads = infer_model_dims(*arr.shape)
-                    title = f"{method} — {task}_{model}  (L={n_layers}, H={n_heads})"
-                    fig = self._create_plot(arr, title)
+                    if self.percent < 1.0:
+                        arr = apply_top_percent_mask(arr, method, task, model, self.percent, self.use_abs)
 
-                    fname = f"{task}_{model}_{self.data_type}.png"
+                    if self.base_method is not None:
+                        base_arr = load_metric(self.base_method, task, model, self.data_type)
+                        if base_arr is None:
+                            print(f"No base data for: {self.base_method}, {task}, {model}. Skipping...")
+                            continue
+                        if self.percent < 1.0:
+                            base_arr = apply_top_percent_mask(base_arr, self.base_method, task, model, self.percent, self.use_abs)
+                        arr = arr - base_arr
+
+                    n_layers, n_heads = infer_model_dims(*arr.shape)
+                    base_tag = f" − {self.base_method}" if self.base_method is not None else ""
+                    title = f"{method}{base_tag} — {task}_{model}  (L={n_layers}, H={n_heads})"
+                    fig = self._create_plot(arr, title, show_grid=self.base_method is not None)
+
+                    abs_tag = "_abs" if self.use_abs else ""
+                    pct_tag = f"_top{self.percent:.2f}" if self.percent < 1.0 else ""
+                    base_fname_tag = f"_vs_{self.base_method}" if self.base_method is not None else ""
+                    fname = f"{task}_{model}_{self.data_type}{base_fname_tag}{pct_tag}{abs_tag}.png"
                     out_path = os.path.join(PLOTS_DIR, "circuit_heatmap", method, fname)
                     save_figure(fig, out_path)
 
@@ -150,12 +167,13 @@ class CircuitHeatmap(Plotter):
 
         return padded, x_edges, y_edges, x_tick_pos, x_tick_labels, y_tick_pos, y_tick_labels
 
-    def _create_plot(self, arr: np.ndarray, title: str) -> Figure:
+    def _create_plot(self, arr: np.ndarray, title: str, show_grid: bool = False) -> Figure:
         """Render a circuit score matrix as a colour-coded heatmap.
 
         Args:
             arr: Score matrix of shape (n_forward, n_backward).
             title: Plot title string.
+            show_grid: Draw light-grey lines at layer-block boundaries.
         """
         n_forward, n_backward = arr.shape
         n_layers, n_heads = infer_model_dims(n_forward, n_backward)
@@ -165,7 +183,8 @@ class CircuitHeatmap(Plotter):
 
         fig, ax = plt.subplots(figsize=(n_backward / 10.0, n_forward / 10.0))
 
-        vmax = float(np.percentile(np.abs(arr), 99.9)) or 1.0
+        vmax = float(np.percentile(np.abs(arr[~np.isnan(arr)]), 99.9)) if np.any(~np.isnan(arr)) else 1.0
+        vmax = vmax or 1.0
         cmap = plt.cm.RdBu_r.copy()
         cmap.set_bad("white")
 
@@ -178,6 +197,25 @@ class CircuitHeatmap(Plotter):
             rasterized=True,
         )
         ax.invert_yaxis()
+
+        if show_grid:
+            _kw = dict(color="lightgrey", linewidth=0.5, zorder=2)
+            # vertical lines at X block edges
+            for L in range(n_layers):
+                s = 1 + L * (6 * n_heads + 2)
+                e = s + 6 * n_heads + 1
+                ax.axvline(x_edges[s], **_kw)
+                ax.axvline(x_edges[e], **_kw)
+            ax.axvline(x_edges[-3], **_kw)   # lm_head start
+            ax.axvline(x_edges[-2], **_kw)   # lm_head end
+            # horizontal lines at Y block edges
+            ax.axhline(y_edges[1], **_kw)    # emb start
+            ax.axhline(y_edges[2], **_kw)    # emb end
+            for L in range(n_layers):
+                s = 3 + L * (2 * n_heads + 2)
+                e = s + 2 * n_heads + 1
+                ax.axhline(y_edges[s], **_kw)
+                ax.axhline(y_edges[e], **_kw)
 
         ax.set_yticks(y_tick_pos)
         ax.set_yticklabels(y_tick_labels, fontsize=6)
