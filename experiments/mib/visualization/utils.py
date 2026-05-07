@@ -29,10 +29,9 @@ def load_circuit_data(
     method: str,
     task: str,
     model: str,
-    load_variance: bool = False,
+    data_type: str = "scores",
 ) -> np.ndarray | None:
-    file_name = "variance.pt" if load_variance else "scores.pt"
-    path = os.path.join(CIRCUITS_DIR, method, f"{task}_{model}", file_name)
+    path = os.path.join(CIRCUITS_DIR, method, f"{task}_{model}", f"{data_type}.pt")
     if not os.path.exists(path):
         return None
     return torch.load(path, map_location="cpu", weights_only=True).float().numpy()
@@ -75,15 +74,16 @@ def load_metric(
 ) -> np.ndarray | None:
     """Load scores, variance, or CV matrix for one (method, task, model).
 
-    data_type: "scores" | "variance" | "cv"
+    data_type: "scores" | "variance_in_between" | "variance_within" | "cv_in_between" | "cv_within"
     CV entries where |score| < min_abs_score are set to NaN.
     """
-    scores = load_circuit_data(method, task, model, load_variance=False)
+    scores = load_circuit_data(method, task, model, "scores")
     if data_type == "scores":
         return scores
-    variance = load_circuit_data(method, task, model, load_variance=True)
-    if data_type == "variance":
-        return variance
+    if data_type in ("variance_in_between", "variance_within"):
+        return load_circuit_data(method, task, model, data_type)
+    variance_key = "variance_in_between" if data_type == "cv_in_between" else "variance_within"
+    variance = load_circuit_data(method, task, model, variance_key)
     if scores is None or variance is None:
         return None
     safe_denom = np.where(np.abs(scores) >= min_abs_score, np.abs(scores), 1.0)
@@ -102,7 +102,7 @@ def apply_top_percent_mask(
 
     Ranking is by absolute score when use_abs=True, otherwise by raw score.
     """
-    scores = load_circuit_data(method, task, model, load_variance=False)
+    scores = load_circuit_data(method, task, model, "scores")
     if scores is None:
         return metric
     ranking = np.abs(scores) if use_abs else scores

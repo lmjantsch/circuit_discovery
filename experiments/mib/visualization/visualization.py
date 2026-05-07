@@ -65,9 +65,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--data_type",
-        choices=["scores", "variance", "cv"],
+        choices=["scores", "variance_in_between", "variance_within", "cv_in_between", "cv_within"],
         default="scores",
-        help="Which metric to plot: scores, variance, or coefficient of variation (cv)",
+        help="Which metric to plot: scores, variance_in_between, variance_within, cv_in_between (variance_in_between / |score|), or cv_within (variance_within / |score|)",
     )
     parser.add_argument(
         "--show-errorbars",
