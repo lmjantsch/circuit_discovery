@@ -17,6 +17,7 @@ class Plotter(ABC):
         self.show_errorbars = args.show_errorbars
         self.percent = args.percent
         self.use_abs = args.use_abs
+        self.base_method = args.base_method
 
     @abstractmethod
     def plot(self):
@@ -85,6 +86,12 @@ def main() -> None:
         action="store_true",
         dest="use_abs",
         help="Rank edges by absolute score when applying --percent",
+    )
+    parser.add_argument(
+        "--base_method",
+        default=None,
+        metavar="METHOD",
+        help="Subtract this method's scores to plot the residual (method - base_method)",
     )
     args = parser.parse_args()
 
