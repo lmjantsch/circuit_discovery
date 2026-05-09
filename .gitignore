@@ -6,8 +6,11 @@ __pycache__/
 plots/
 scripts/
 grid_search/
-_grid_search/
+frozen_grid_search/
 grid_search_dryrun/
+
+# Re-cloned MIB-circuit-track (formerly a submodule, now a regular checkout)
+experiments/mib/MIB-circuit-track/
 
 
 # Files

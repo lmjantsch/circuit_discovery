@@ -7,9 +7,9 @@ import torch
 import matplotlib.pyplot as plt
 
 _PAR = os.path.dirname(os.path.dirname(__file__))
-CIRCUITS_DIR = os.path.join(_PAR, "circuits")
-RESULTS_DIR = os.path.join(_PAR, "results")
-PLOTS_DIR = os.path.join(_PAR, "plots")
+CIRCUITS_DIR = os.path.join(_PAR, "grid_search/circuits")
+RESULTS_DIR = os.path.join(_PAR, "grid_search/results")
+PLOTS_DIR = os.path.join(_PAR, "grid_search/plots")
 
 
 def infer_model_dims(n_forward: int, n_backward: int) -> tuple[int, int]:

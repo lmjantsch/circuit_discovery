@@ -120,7 +120,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn-softcap-fn", default="tanh",
-        help="Gemma2 logit softcap rule (Rule 2). Key into ACT_FN.",
+        help="Gemma2 attn-logit softcap rule. Key into ACT_FN ('tanh' default; 'identity_tanh' skips softcap derivative).",
+    )
+    parser.add_argument(
+        "--final-softcap-fn", default="tanh",
+        help="Gemma2 final-logit softcap rule. Key into ACT_FN ('tanh' default; 'identity_tanh' skips softcap derivative).",
     )
     parser.add_argument(
         '--weights',
@@ -162,7 +166,8 @@ def _load_model_components(
     ).eval()
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    adapter = adapter_cls(model, frozen_norm = lvp_kwargs['frozen_norm'], ignore_norm=args.ignore_norm)
+    adapter = adapter_cls(model, frozen_norm = lvp_kwargs['frozen_norm'], ignore_norm=args.ignore_norm,
+                          final_softcap_fn=args.final_softcap_fn)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
         q_weight=args.weights[0], k_weight=args.weights[1], v_weight=args.weights[2],

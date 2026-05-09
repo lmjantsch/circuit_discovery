@@ -7,7 +7,8 @@ from tracer.modeling_utils import apply_inverse_rope
 
 class ModelAdapter(ABC):
 
-    def __init__(self, model, ignore_norm: bool = False, frozen_norm: bool = False):
+    def __init__(self, model, ignore_norm: bool = False, frozen_norm: bool = False,
+                 final_softcap_fn: str = 'tanh'):
         self.model = model
         self.config = model.config
         self.device = model.device
@@ -15,6 +16,10 @@ class ModelAdapter(ABC):
 
         self.ignore_norm = ignore_norm
         self.frozen_norm = frozen_norm
+        # Selects the activation used in Gemma2's final-logit softcap path.
+        # 'tanh' = standard autograd (current default, applies (1 - tanh^2) in backward).
+        # 'identity_tanh' = skips the softcap derivative (matches legacy eap_compat=False).
+        self.final_softcap_fn = final_softcap_fn
 
     @property
     def source_dims(self) -> int:
@@ -487,7 +492,9 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
         raw = self.model.lm_head.output
         cap = getattr(self.config, 'final_logit_softcapping', None)
         if cap is not None:
-            return torch.tanh(raw / cap) * cap
+            from linear_transformer.modules import ACT_FN
+            tanh_fn = ACT_FN.get(self.final_softcap_fn, torch.tanh)
+            return tanh_fn(raw / cap) * cap
         return raw
 
     # graients
