@@ -137,6 +137,10 @@ def parse_args() -> argparse.Namespace:
         '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post'], default='post'
     )
     parser.add_argument(
+        '--variance-type', dest='variance_type', type=str,
+        choices=['within', 'in_between', 'none'], default='in_between',
+    )
+    parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
     )
     return parser.parse_args()
@@ -170,6 +174,7 @@ def _load_model_components(
                           final_softcap_fn=args.final_softcap_fn)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
+        variance_type=args.variance_type,
         q_weight=args.weights[0], k_weight=args.weights[1], v_weight=args.weights[2],
         gate_weight=args.weights[3], up_weight=args.weights[4],
         scale_loc=args.scale_loc
@@ -241,7 +246,7 @@ def run() -> None:
             json.dump(circuit, f, indent=2)
         torch.save(scores, os.path.join(circuit_dir, 'scores.pt'))
         if variance != None:
-            torch.save(variance, os.path.join(circuit_dir, 'variance.pt'))
+            torch.save(variance, os.path.join(circuit_dir, f'variance_{args.variance_type}.pt'))
          
         logger.info("  Done in %.1fs — saved %s", time.time() - t0, circuit_dir)
 
