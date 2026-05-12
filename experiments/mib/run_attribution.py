@@ -108,8 +108,9 @@ def parse_args() -> argparse.Namespace:
         help="MLP activation rule (Rule 2). Key into ACT_FN. Defaults to model-specific LVP fn.",
     )
     parser.add_argument(
-        "--frozen-norm", dest="frozen_norm", action="store_true", default=False,
-        help="Disable detaching the normalisation factor in RMSNorm/LayerNorm (Rule 1).",
+        "--norm-approx", dest="norm_approx", default=None,
+        choices=[None, "frozen", "dynamic_thr", "dynamic_msk"],
+        help="Norm approximation mode: None=original, frozen=detach denominator, dynamic_thr=threshold-based, dynamic_msk=input-ID mask.",
     )
     parser.add_argument(
         "--ignore-norm", dest="ignore_norm", action="store_true", default=False,
@@ -166,7 +167,11 @@ def _load_model_components(
     ).eval()
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    adapter = adapter_cls(model, frozen_norm = lvp_kwargs['frozen_norm'], ignore_norm=args.ignore_norm)
+    for layer in model.model.layers:
+        layer.post_attention_layernorm.norm_approx = None
+        layer.post_feedforward_layernorm.norm_approx = None
+
+    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=args.norm_approx)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
         variance_type=args.variance_type,
@@ -184,7 +189,7 @@ def run() -> None:
         "attn_act_fn": args.attn_act_fn,
         "matmul_fn": args.matmul_fn,
         "mul_fn": args.mul_fn,
-        "frozen_norm": args.frozen_norm,
+        "norm_approx": args.norm_approx,
         "attn_softcap_fn": args.attn_softcap_fn,
         "center_writing_weights": args.center_writing_weights,
     }

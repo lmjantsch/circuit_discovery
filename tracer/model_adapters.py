@@ -4,17 +4,18 @@ import torch
 from torch import nn
 
 from tracer.modeling_utils import apply_inverse_rope
+from linear_transformer.modules.activations import SoftcapFN
 
 class ModelAdapter(ABC):
 
-    def __init__(self, model, ignore_norm: bool = False, frozen_norm: bool = False):
+    def __init__(self, model, ignore_norm: bool = False, norm_approx: str | None = None):
         self.model = model
         self.config = model.config
         self.device = model.device
         self.dtype = model.dtype
 
         self.ignore_norm = ignore_norm
-        self.frozen_norm = frozen_norm
+        self.norm_approx = norm_approx
 
     @property
     def source_dims(self) -> int:
@@ -153,43 +154,64 @@ class ModelAdapter(ABC):
     def logits(self):
         pass
 
+    # input ids
+    @abstractmethod
+    def input_ids(self) -> torch.Tensor:
+        pass
 
-    # graients 
+    # norm baseline hooks
+    @abstractmethod
+    def ln_1_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        pass
+
+    @abstractmethod
+    def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        pass
+
+    # graients
     @abstractmethod
     def mlp_in_grad(
         self,
         gate_grad: torch.Tensor,
         up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
-        layer: nn.Module
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
+        layer: nn.Module,
     ):
         pass
-    
+
     @abstractmethod
     def query_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
         pass
-    
+
     @abstractmethod
     def key_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
         pass
-    
+
     @abstractmethod
     def value_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
@@ -201,6 +223,8 @@ class ModelAdapter(ABC):
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         W_linear: torch.Tensor,
         norm: nn.Module,
         rot_embeds: torch.Tensor = None,
@@ -212,6 +236,8 @@ class ModelAdapter(ABC):
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         norm: nn.Module,
     ):
         pass
@@ -266,6 +292,9 @@ class Llama2ModelAdapter(ModelAdapter):
     def emb_out(self) -> torch.Tensor:
         return self.model.model.embed_tokens.output
 
+    def input_ids(self) -> torch.Tensor:
+        return self.model.model.embed_tokens.input
+
     def rotary_emb_out(self):
         rot_cos, rot_sin = self.model.model.rotary_emb.output
         return (rot_cos.detach(), rot_sin.detach())
@@ -279,6 +308,18 @@ class Llama2ModelAdapter(ModelAdapter):
 
     def residual_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.output
+
+    def ln_1_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        if self.norm_approx == 'dynamic_thr':
+            layer.input_layernorm.source.baseline_hidden_hook_0.output = baseline_tensor
+        elif self.norm_approx == 'dynamic_msk':
+            layer.input_layernorm.source.baseline_hidden_hook_1.output = mask
+
+    def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        if self.norm_approx == 'dynamic_thr':
+            layer.post_attention_layernorm.source.baseline_hidden_hook_0.output = baseline_tensor
+        elif self.norm_approx == 'dynamic_msk':
+            layer.post_attention_layernorm.source.baseline_hidden_hook_1.output = mask
 
     # attention helpers
     def build_attn_source(self, layer: nn.Module) -> None:
@@ -318,133 +359,145 @@ class Llama2ModelAdapter(ModelAdapter):
         return self.model.lm_head.output
     
 
-    # graients 
+    # graients
     def mlp_in_grad(
         self,
         gate_grad: torch.Tensor,
         up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
-        layer: nn.Module
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
+        layer: nn.Module,
     ):
-        
-        # STEP 1: Backprop through the projection
         W_gate_linear = layer.mlp.gate_proj.weight.data
         gate_grad_post_norm = torch.einsum('bsd, dD -> bsD', gate_grad, W_gate_linear)
-
         W_up_linear = layer.mlp.up_proj.weight.data
         up_grad_post_norm = torch.einsum('bsd, dD -> bsD', up_grad, W_up_linear)
-
         grad = gate_grad_post_norm + up_grad_post_norm
-
         return self._compute_norm_input_gradient(
-            grad=grad,
-            x_pre_norm=x_pre_norm, 
-            norm=layer.post_attention_layernorm
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            norm=layer.post_attention_layernorm,
         )
-    
+
     def query_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
         B, S, _ = grad.shape
         grad = grad.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         return self._compute_headwise_attn_gradient(  # does not require inverse rot_embeds as cached at linear out
-            grad=grad, 
-            x_pre_norm=x_pre_norm, 
-            W_linear=layer.self_attn.q_proj.weight.data, 
-            norm=layer.input_layernorm
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            W_linear=layer.self_attn.q_proj.weight.data, norm=layer.input_layernorm,
         )
-    
+
     def key_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
         return self._compute_headwise_attn_gradient(
-            grad=grad, 
-            x_pre_norm=x_pre_norm, 
-            W_linear=layer.self_attn.k_proj.weight.data,
-            norm=layer.input_layernorm, 
-            rot_embeds=cache['rotary_emb']
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            W_linear=layer.self_attn.k_proj.weight.data, norm=layer.input_layernorm,
+            rot_embeds=cache['rotary_emb'],
         )
-    
+
     def value_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
-        return self._compute_headwise_attn_gradient( 
-            grad=grad, 
-            x_pre_norm=x_pre_norm, 
-            W_linear=layer.self_attn.v_proj.weight.data,
-            norm=layer.input_layernorm,
+        return self._compute_headwise_attn_gradient(
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            W_linear=layer.self_attn.v_proj.weight.data, norm=layer.input_layernorm,
         )
 
     # gradient helpers
-    @torch.no_grad() 
+    @torch.no_grad()
     def _compute_norm_input_gradient(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         norm: nn.Module,
     ):
         input_dtype = grad.dtype
         x_pre_norm = x_pre_norm.float()
 
-        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
+        if grad.dim() == x_pre_norm.dim() + 1:  # accommodate head dimension
             x_pre_norm = x_pre_norm.unsqueeze(1)
+            x_baseline = x_baseline.unsqueeze(1)
+            mask = mask.unsqueeze(1)
 
         u = (grad * norm.weight.data).float()
 
-        # ignore all scaling and centering
         if self.ignore_norm:
             return u.to(input_dtype)
 
         variance = (x_pre_norm ** 2).mean(dim=-1, keepdim=True)
         sigma = torch.sqrt(variance + norm.variance_epsilon)
-        
-        # treat rms as detached adjoint transformation
-        if self.frozen_norm == True:
-            grad_pre_norm =  u / sigma
+
+        if self.norm_approx in ('dynamic_thr', 'dynamic_msk'):
+            u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
+            term2 = (u_dot_x / (self.model_dim * (variance + norm.variance_epsilon))) * x_pre_norm
+            frozen_grad_pre_norm = u / sigma
+            grad_pre_norm = (u - term2) / sigma
+            if self.norm_approx == 'dynamic_thr':
+                x_baseline_f = x_baseline.to(torch.float32)
+                clean_norm = x_pre_norm.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                scale = x_baseline_f.norm(dim=-1, keepdim=True) / clean_norm
+                sim = torch.cosine_similarity(x_pre_norm, x_baseline_f, dim=-1).unsqueeze(-1)
+                sin2 = (1 - sim.pow(2)).clamp(min=0)
+                f_diff = (scale - 1).abs() - ((1 - sim).pow(2) + sin2 * (scale - 1).pow(2)).sqrt()
+                mask = f_diff >= 0.0
+            grad_pre_norm = torch.where(mask, grad_pre_norm, frozen_grad_pre_norm)
             return grad_pre_norm.to(input_dtype)
-        
+
+        if self.norm_approx == 'frozen':
+            return (u / sigma).to(input_dtype)
+
         # complete gradient through rms term
         u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
         term2 = (u_dot_x / (self.model_dim * (variance + norm.variance_epsilon))) * x_pre_norm
-        grad_pre_norm = (u - term2) / sigma
-        
-        return grad_pre_norm.to(input_dtype)
+        return ((u - term2) / sigma).to(input_dtype)
 
-    @torch.no_grad() 
+    @torch.no_grad()
     def _compute_headwise_attn_gradient(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         W_linear: torch.Tensor,
         norm: nn.Module,
         rot_embeds: torch.Tensor = None,
     ):
         if rot_embeds is not None:
             grad = apply_inverse_rope(grad, rot_embeds)
-        
-        # STEP 1: Backprop through the projection
+
         W_linear = W_linear.view(-1, self.head_dim, self.model_dim)
-        if W_linear.size(0) != self.n_heads: # repeat W_linear for grouped query attention (GQA)
+        if W_linear.size(0) != self.n_heads:  # repeat W_linear for grouped query attention (GQA)
             num_key_value_groups = self.n_heads // W_linear.size(0)
             W_linear = W_linear.repeat_interleave(num_key_value_groups, dim=0)
 
         grad_post_norm = torch.einsum('bhsd, hdD -> bhsD', grad, W_linear)
-        
+
         # STEP 2: Backprop through the RMSNorm
-        grad_pre_norm = self._compute_norm_input_gradient(grad_post_norm, x_pre_norm, norm)
-        
+        grad_pre_norm = self._compute_norm_input_gradient(grad_post_norm, x_pre_norm, x_baseline, mask, norm)
+
         return grad_pre_norm.transpose(0, 1)
     
 
@@ -459,7 +512,13 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
     def residual_mid(self, layer: nn.Module) -> torch.Tensor:
         return layer.pre_feedforward_layernorm.input
 
-    @torch.no_grad() 
+    def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        if self.norm_approx == 'dynamic_thr':
+            layer.pre_feedforward_layernorm.source.baseline_hidden_hook_0.output = baseline_tensor
+        elif self.norm_approx == 'dynamic_msk':
+            layer.pre_feedforward_layernorm.source.baseline_hidden_hook_1.output = mask
+
+    @torch.no_grad()
     def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
         z = layer.self_attn.source.attention_interface_0.output[0].detach()
         _, _, H, d = z.shape
@@ -485,9 +544,9 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
     # logits
     def logits(self):
         raw = self.model.lm_head.output
-        cap = getattr(self.config, 'final_logit_softcapping', None)
-        if cap is not None:
-            return torch.tanh(raw / cap) * cap
+        # cap = getattr(self.config, 'final_logit_softcapping', None)
+        # if cap is not None:
+        #     return SoftcapFN.apply(raw, cap)
         return raw
 
     # graients
@@ -496,57 +555,67 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
         gate_grad: torch.Tensor,
         up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
-        layer: nn.Module
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
+        layer: nn.Module,
     ):
-        
-        # STEP 1: Backprop through the projection
         W_gate_linear = layer.mlp.gate_proj.weight.data
         gate_grad_post_norm = torch.einsum('bsd, dD -> bsD', gate_grad, W_gate_linear)
-
         W_up_linear = layer.mlp.up_proj.weight.data
         up_grad_post_norm = torch.einsum('bsd, dD -> bsD', up_grad, W_up_linear)
-
         grad = gate_grad_post_norm + up_grad_post_norm
-
         return self._compute_norm_input_gradient(
-            grad=grad,
-            x_pre_norm=x_pre_norm, 
-            norm=layer.pre_feedforward_layernorm
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            norm=layer.pre_feedforward_layernorm,
         )
 
-    @torch.no_grad() 
+    @torch.no_grad()
     def _compute_norm_input_gradient(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         norm: nn.Module,
     ):
         input_dtype = grad.dtype
         x_pre_norm = x_pre_norm.float()
 
-        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
+        if grad.dim() == x_pre_norm.dim() + 1:  # accommodate head dimension
             x_pre_norm = x_pre_norm.unsqueeze(1)
+            x_baseline = x_baseline.unsqueeze(1)
+            mask = mask.unsqueeze(1)
 
         u = grad.float() * (1 + norm.weight.data.float())
 
-        # ignore all scaling and centering
         if self.ignore_norm:
             return u.to(input_dtype)
 
         variance = (x_pre_norm ** 2).mean(dim=-1, keepdim=True)
         sigma = torch.sqrt(variance + norm.eps)
-        
-        # treat rms as detached adjoint transformation
-        if self.frozen_norm == True:
-            grad_pre_norm =  u / sigma
+
+        if self.norm_approx in ('dynamic_thr', 'dynamic_msk'):
+            u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
+            term2 = (u_dot_x / (self.model_dim * (variance + norm.eps))) * x_pre_norm
+            frozen_grad_pre_norm = u / sigma
+            grad_pre_norm = (u - term2) / sigma
+            if self.norm_approx == 'dynamic_thr':
+                x_baseline_f = x_baseline.to(torch.float32)
+                clean_norm = x_pre_norm.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                scale = x_baseline_f.norm(dim=-1, keepdim=True) / clean_norm
+                sim = torch.cosine_similarity(x_pre_norm, x_baseline_f, dim=-1).unsqueeze(-1)
+                sin2 = (1 - sim.pow(2)).clamp(min=0)
+                f_diff = (scale - 1).abs() - ((1 - sim).pow(2) + sin2 * (scale - 1).pow(2)).sqrt()
+                mask = f_diff >= 0.0
+            grad_pre_norm = torch.where(mask, grad_pre_norm, frozen_grad_pre_norm)
             return grad_pre_norm.to(input_dtype)
-        
-        # complete gradient through rms term
+
+        if self.norm_approx == 'frozen':
+            return (u / sigma).to(input_dtype)
+
         u_dot_x = (u * x_pre_norm).sum(dim=-1, keepdim=True)
         term2 = (u_dot_x / (self.model_dim * (variance + norm.eps))) * x_pre_norm
-        grad_pre_norm = (u - term2) / sigma
-        
-        return grad_pre_norm.to(input_dtype)
+        return ((u - term2) / sigma).to(input_dtype)
 
 
 
@@ -591,6 +660,9 @@ class GPT2ModelAdapter(ModelAdapter):
     def emb_out(self) -> torch.Tensor:
         return self.model.transformer.wte.output
 
+    def input_ids(self) -> torch.Tensor:
+        return self.model.transformer.wte.input
+
     # residual positions
     def residual_in(self, layer: nn.Module) -> torch.Tensor:
         return layer.ln_1.input
@@ -600,6 +672,18 @@ class GPT2ModelAdapter(ModelAdapter):
 
     def residual_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.output
+
+    def ln_1_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        if self.norm_approx == 'dynamic_thr':
+            layer.ln_1.source.baseline_hidden_hook_0.output = baseline_tensor
+        elif self.norm_approx == 'dynamic_msk':
+            layer.ln_1.source.baseline_hidden_hook_1.output = mask
+
+    def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
+        if self.norm_approx == 'dynamic_thr':
+            layer.ln_2.source.baseline_hidden_hook_0.output = baseline_tensor
+        elif self.norm_approx == 'dynamic_msk':
+            layer.ln_2.source.baseline_hidden_hook_1.output = mask
 
     # attention helpers
     def build_attn_source(self, layer: nn.Module) -> None:
@@ -642,86 +726,86 @@ class GPT2ModelAdapter(ModelAdapter):
     def logits(self):
         return self.model.lm_head.output 
 
-    # graients 
+    # graients
     def mlp_in_grad(
         self,
         gate_grad: torch.Tensor,
         up_grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
-        layer: nn.Module
-    ):  
-        # STEP 1: Backprop through the projection
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
+        layer: nn.Module,
+    ):
         W_up_linear = layer.mlp.c_fc.weight.data
-        grad = torch.einsum('bsd, Dd -> bsD', up_grad, W_up_linear) # -> weights have shape (input, output)
-
+        grad = torch.einsum('bsd, Dd -> bsD', up_grad, W_up_linear)  # weights have shape (input, output)
         return self._compute_norm_input_gradient(
-            grad=grad,
-            x_pre_norm=x_pre_norm, 
-            norm=layer.ln_2
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask, norm=layer.ln_2,
         )
-    
+
     def query_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
         B, S, _ = grad.shape
         grad = grad.reshape(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         return self._compute_headwise_attn_gradient(
-            grad=grad, 
-            x_pre_norm=x_pre_norm, 
-            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 0, :],
-            norm=layer.ln_1
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 0, :], norm=layer.ln_1,
         )
-    
+
     def key_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
         return self._compute_headwise_attn_gradient(
-            grad=grad, 
-            x_pre_norm=x_pre_norm, 
-            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 1, :],
-            norm=layer.ln_1
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 1, :], norm=layer.ln_1,
         )
-    
+
     def value_in_grad(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         layer: nn.Module,
         cache: dict,
     ):
-        return self._compute_headwise_attn_gradient( 
-            grad=grad, 
-            x_pre_norm=x_pre_norm, 
-            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 2, :], 
-            norm=layer.ln_1
+        return self._compute_headwise_attn_gradient(
+            grad=grad, x_pre_norm=x_pre_norm, x_baseline=x_baseline, mask=mask,
+            W_linear=layer.attn.c_attn.weight.data.reshape(self.model_dim, 3, -1)[:, 2, :], norm=layer.ln_1,
         )
 
-    
     # gradient helpers
-    @torch.no_grad() 
+    @torch.no_grad()
     def _compute_norm_input_gradient(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         norm: nn.Module,
     ):
         input_dtype = grad.dtype
         x_pre_norm = x_pre_norm.float()
 
-        if grad.dim() == x_pre_norm.dim() + 1: # accommodate head dimension
+        if grad.dim() == x_pre_norm.dim() + 1:  # accommodate head dimension
             x_pre_norm = x_pre_norm.unsqueeze(1)
+            x_baseline = x_baseline.unsqueeze(1)
+            mask = mask.unsqueeze(1)
 
         u = grad.float() * norm.weight.data.float()
 
-        # ignore all scaling and centering
         if self.ignore_norm:
             return u.to(input_dtype)
 
@@ -730,34 +814,44 @@ class GPT2ModelAdapter(ModelAdapter):
         variance = (x_centered ** 2).mean(dim=-1, keepdim=True)
         sigma = torch.sqrt(variance + norm.eps)
 
-        # treat layernorm as detached adjoint transformation
-        if self.frozen_norm == True:
-            grad_pre_norm =  u / sigma
+        if self.norm_approx in ('dynamic_thr', 'dynamic_msk'):
+            frozen_grad_pre_norm = u / sigma
+            u_mean = u.mean(dim=-1, keepdim=True)
+            u_dot_xc = (u * x_centered).sum(dim=-1, keepdim=True)
+            term2 = (u_dot_xc / (self.model_dim * (variance + norm.eps))) * x_centered
+            grad_pre_norm = (u - u_mean - term2) / sigma
+            if self.norm_approx == 'dynamic_thr':
+                x_baseline_f = x_baseline.to(torch.float32)
+                clean_norm = x_pre_norm.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                scale = x_baseline_f.norm(dim=-1, keepdim=True) / clean_norm
+                sim = torch.cosine_similarity(x_pre_norm, x_baseline_f, dim=-1).unsqueeze(-1)
+                sin2 = (1 - sim.pow(2)).clamp(min=0)
+                f_diff = (scale - 1).abs() - ((1 - sim).pow(2) + sin2 * (scale - 1).pow(2)).sqrt()
+                mask = f_diff >= 0.0
+            grad_pre_norm = torch.where(mask, grad_pre_norm, frozen_grad_pre_norm)
             return grad_pre_norm.to(input_dtype)
 
-        # complete gradient through layernorm
+        if self.norm_approx == 'frozen':
+            return (u / sigma).to(input_dtype)
+
         u_mean = u.mean(dim=-1, keepdim=True)
         u_dot_xc = (u * x_centered).sum(dim=-1, keepdim=True)
         term2 = (u_dot_xc / (self.model_dim * (variance + norm.eps))) * x_centered
-        grad_pre_norm = (u - u_mean - term2) / sigma
-        
-        return grad_pre_norm.to(input_dtype)
+        return ((u - u_mean - term2) / sigma).to(input_dtype)
 
-    @torch.no_grad() 
+    @torch.no_grad()
     def _compute_headwise_attn_gradient(
         self,
         grad: torch.Tensor,
         x_pre_norm: torch.Tensor,
+        x_baseline: torch.Tensor,
+        mask: torch.Tensor,
         W_linear: torch.Tensor,
         norm: nn.Module,
         rot_embeds: torch.Tensor = None,
-    ):  
-        # STEP 1: Backprop through the projection
+    ):
         W_linear = W_linear.T.reshape(-1, self.head_dim, self.model_dim)  # Conv_1D stores weights in (n_in, n_out)
         grad_post_norm = torch.einsum('bhsd, hdD -> bhsD', grad, W_linear)
-        
-        # STEP 2: Backprop through the LayerNorm
-        grad_pre_norm = self._compute_norm_input_gradient(grad_post_norm, x_pre_norm, norm)
-        
+        grad_pre_norm = self._compute_norm_input_gradient(grad_post_norm, x_pre_norm, x_baseline, mask, norm)
         return grad_pre_norm.transpose(0, 1)
         

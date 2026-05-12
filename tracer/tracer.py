@@ -40,7 +40,8 @@ class EdgeCircuitTracer:
 
         self.cache = {}
         self.source_cache = None   # shape: [source_dims, B, S, d]
-        self.baseline_cache = None
+        self.baseline_cache = {}
+        self.baseline_source_cache = None
         self.disable_source_caching = False
 
         self.clean_embeds = None
@@ -49,6 +50,7 @@ class EdgeCircuitTracer:
         self.curr_batch_size = None
         self.curr_seq_len = None
         self.curr_attention_mask = None  # [B, S], 1 for real tokens
+        self.curr_id_mask = None         # [B, S, 1], True where clean_id == corrupt_id
 
     def _init_circuit_tensor(self) -> torch.Tensor:
         return torch.zeros(self.adapter.source_dims, self.adapter.grad_dims, dtype=self.adapter.dtype, device=self.cache_device)
@@ -87,6 +89,7 @@ class EdgeCircuitTracer:
 
             self.curr_batch_size, self.curr_seq_len = clean_inputs['input_ids'].shape
             self.curr_attention_mask = clean_inputs['attention_mask']
+            self.curr_id_mask = (clean_inputs['input_ids'] == corrupt_inputs['input_ids']).unsqueeze(-1).to(self.adapter.device)  # [B, S, 1]
 
             target_idx = torch.full((self.curr_batch_size,), self.curr_seq_len - 1)
             if self.tokenizer.padding_side == 'right':
@@ -98,7 +101,9 @@ class EdgeCircuitTracer:
                     with self.model.trace(**corrupt_inputs):
                         self._forward_pass_and_cache()
                     self.corrupt_embeds = self.cache['emb'].detach().clone()
-                    self.baseline_cache = self.source_cache
+                    self.baseline_cache = {f'{i}.{k}': self.cache[f'{i}.{k}'] for i in range(self.adapter.n_layers) for k in ['mid', 'out']}
+                    self.baseline_cache[f'-1.out'] = self.cache['-1.out']
+                    self.baseline_source_cache = self.source_cache
                     self.source_cache = self._init_source_cache()
 
                 with self.model.trace(**clean_inputs):
@@ -107,8 +112,8 @@ class EdgeCircuitTracer:
                     metric = self._get_metric(clean_targets, corrupt_targets, target_idx, use_counterfactual)
 
                     if use_counterfactual == True or integration_steps > 1:
-                        self.source_cache -= self.baseline_cache
-                        self.baseline_cache = None
+                        self.source_cache -= self.baseline_source_cache
+                        self.baseline_source_cache = None
 
                     self.num_processed_samples += self.curr_batch_size
                     self._backward_pass_and_scoring(metric)
@@ -143,8 +148,9 @@ class EdgeCircuitTracer:
 
     def empty_cache(self):
         self.cache = {}
+        self.baseline_cache = {}
         self.source_cache = None
-        self.baseline_cache = None
+        self.baseline_source_cache = None
 
     def _forward_pass_and_cache(self, integrated_embeds: torch.Tensor | None = None):
         B, S, d = self.curr_batch_size, self.curr_seq_len, self.adapter.model_dim  # (B, S, d)
@@ -158,30 +164,36 @@ class EdgeCircuitTracer:
             self.cache['rotary_emb'] = self.adapter.rotary_emb_out()
 
         first_layer = self.adapter.layers[0]
-        self.cache[-1]['out'] = self.adapter.residual_in(first_layer).detach()
+        self.cache['-1.out'] = self.adapter.residual_in(first_layer).detach()
         self._update_source_cache(
             self.adapter.residual_in(first_layer).detach().reshape(1, B, S, d), type='emb'
         )
 
         for layer_id, layer in enumerate(self.adapter.layers):
 
+            if self.adapter.norm_approx in ('dynamic_thr', 'dynamic_msk') and self.baseline_cache:
+                self.adapter.ln_1_baseline_hook(layer, self.baseline_cache[f'{layer_id - 1}.out'], self.curr_id_mask)
+
             self.adapter.build_attn_source(layer)  # call to build source
-            self.cache[layer_id]['query_out'] = self.adapter.query_out(layer)
-            self.cache[layer_id]['key_out'] = self.adapter.key_out(layer)
-            self.cache[layer_id]['value_out'] = self.adapter.value_out(layer)
+            self.cache[f'{layer_id}.query_out'] = self.adapter.query_out(layer)
+            self.cache[f'{layer_id}.key_out'] = self.adapter.key_out(layer)
+            self.cache[f'{layer_id}.value_out'] = self.adapter.value_out(layer)
 
             self._update_source_cache(
                 self.adapter.per_head_attn_out(layer).detach().reshape(self.adapter.n_heads, B, S, d),
                 type='attn', layer_id=layer_id)
 
-            self.cache[layer_id]['mid'] = self.adapter.residual_mid(layer).detach()
+            self.cache[f'{layer_id}.mid'] = self.adapter.residual_mid(layer).detach()
 
-            self.cache[layer_id]['gate_out'] = self.adapter.gate_out(layer)
-            self.cache[layer_id]['up_out'] = self.adapter.up_out(layer)
+            if self.adapter.norm_approx in ('dynamic_thr', 'dynamic_msk') and self.baseline_cache:
+                self.adapter.ln_2_baseline_hook(layer, self.baseline_cache[f'{layer_id}.mid'], self.curr_id_mask)
+
+            self.cache[f'{layer_id}.gate_out'] = self.adapter.gate_out(layer)
+            self.cache[f'{layer_id}.up_out'] = self.adapter.up_out(layer)
             self._update_source_cache(
                 self.adapter.mlp_out(layer).detach().reshape(1, B, S, d), type='mlp', layer_id=layer_id)
 
-            self.cache[layer_id]['out'] = self.adapter.residual_out(layer)
+            self.cache[f'{layer_id}.out'] = self.adapter.residual_out(layer)
 
         self.cache['logits'] = self.adapter.logits()
 
@@ -203,45 +215,56 @@ class EdgeCircuitTracer:
         B, S, d = self.curr_batch_size, self.curr_seq_len, self.adapter.model_dim  # (B, S, d)
 
         with metric.backward():
-            logit_grad = self.cache[self.adapter.n_layers - 1]['out'].grad.detach().reshape(1, B, S, d)
+            logit_grad = self.cache[f'{self.adapter.n_layers - 1}.out'].grad.detach().reshape(1, B, S, d)
             self._update_scores(logit_grad, type='lm_head')
             del logit_grad
 
             for layer_id in range(self.adapter.n_layers - 1, -1, -1):
                 layer = self.adapter.layers[layer_id]
-                layer_input = self.cache[layer_id - 1]['out'].detach()
+                layer_input = self.cache[f'{layer_id - 1}.out'].detach()
 
-                up_grad = self._scale_and_detach_grad(self.cache[layer_id]['up_out'], self.up_weight, scale_loc=self.scale_loc)
-                gate_grad = self._scale_and_detach_grad(self.cache[layer_id]['gate_out'], self.gate_weight, scale_loc=self.scale_loc)
+                up_grad = self._scale_and_detach_grad(self.cache[f'{layer_id}.up_out'], self.up_weight, scale_loc=self.scale_loc)
+                gate_grad = self._scale_and_detach_grad(self.cache[f'{layer_id}.gate_out'], self.gate_weight, scale_loc=self.scale_loc)
 
                 mlp_in_grad_pre_norm = self.adapter.mlp_in_grad(
                     gate_grad=gate_grad, up_grad=up_grad,
-                    x_pre_norm=self.cache[layer_id]['mid'],
-                    layer=layer
+                    x_pre_norm=self.cache[f'{layer_id}.mid'],
+                    x_baseline=self.baseline_cache.get(f'{layer_id}.mid', self.cache[f'{layer_id}.mid']),
+                    mask=self.curr_id_mask,
+                    layer=layer,
                 ).reshape(1, B, S, d)
                 self._update_scores(mlp_in_grad_pre_norm, type='mlp', layer_id=layer_id)
                 del mlp_in_grad_pre_norm
 
-                v_grad = self._scale_and_detach_grad(self.cache[layer_id]['value_out'], self.v_weight, scale_loc=self.scale_loc)
+                v_grad = self._scale_and_detach_grad(self.cache[f'{layer_id}.value_out'], self.v_weight, scale_loc=self.scale_loc)
 
                 v_proj_in_grad_pre_norm = self.adapter.value_in_grad(
-                    grad=v_grad, x_pre_norm=layer_input, layer=layer, cache=self.cache
+                    grad=v_grad, x_pre_norm=layer_input,
+                    x_baseline=self.baseline_cache.get(f'{layer_id - 1}.out', layer_input),
+                    mask=self.curr_id_mask,
+                    layer=layer, cache=self.cache,
                 ).reshape(self.adapter.n_heads, B, S, d)
                 self._update_scores(v_proj_in_grad_pre_norm, type='attn_v', layer_id=layer_id)
                 del v_proj_in_grad_pre_norm
 
-                k_grad = self._scale_and_detach_grad(self.cache[layer_id]['key_out'], self.k_weight, scale_loc=self.scale_loc)
+                k_grad = self._scale_and_detach_grad(self.cache[f'{layer_id}.key_out'], self.k_weight, scale_loc=self.scale_loc)
 
                 k_proj_in_grad_pre_norm = self.adapter.key_in_grad(
-                    grad=k_grad, x_pre_norm=layer_input, layer=layer, cache=self.cache
+                    grad=k_grad, x_pre_norm=layer_input,
+                    x_baseline=self.baseline_cache.get(f'{layer_id - 1}.out', layer_input),
+                    mask=self.curr_id_mask,
+                    layer=layer, cache=self.cache,
                 ).reshape(self.adapter.n_heads, B, S, d)
                 self._update_scores(k_proj_in_grad_pre_norm, type='attn_k', layer_id=layer_id)
                 del k_proj_in_grad_pre_norm
 
-                q_grad = self._scale_and_detach_grad(self.cache[layer_id]['query_out'], self.q_weight, scale_loc=self.scale_loc)
+                q_grad = self._scale_and_detach_grad(self.cache[f'{layer_id}.query_out'], self.q_weight, scale_loc=self.scale_loc)
 
                 q_proj_in_grad_pre_norm = self.adapter.query_in_grad(
-                    grad=q_grad, x_pre_norm=layer_input, layer=layer, cache=self.cache
+                    grad=q_grad, x_pre_norm=layer_input,
+                    x_baseline=self.baseline_cache.get(f'{layer_id - 1}.out', layer_input),
+                    mask=self.curr_id_mask,
+                    layer=layer, cache=self.cache,
                 ).reshape(self.adapter.n_heads, B, S, d)
                 self._update_scores(q_proj_in_grad_pre_norm, type='attn_q', layer_id=layer_id)
                 del q_proj_in_grad_pre_norm
