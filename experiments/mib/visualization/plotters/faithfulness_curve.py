@@ -9,7 +9,7 @@ class FaithfulnessCurve(Plotter):
 
     def plot(self):
 
-        data = load_faithfulness_data(self.methods, self.tasks, self.models)
+        data = load_faithfulness_data(self.methods, self.tasks, self.models, use_abs=self.use_abs)
 
         for (task, model) in data:
             fig = self._plot_faithfulness(data[(task, model)], f"{task} — {model}")

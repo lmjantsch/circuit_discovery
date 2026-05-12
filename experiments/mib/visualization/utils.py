@@ -41,9 +41,11 @@ def load_faithfulness_data(
     methods: list[str],
     tasks: list[str],
     models: list[str],
+    use_abs: bool = False,
 ) -> dict[tuple[str, str], dict[str, dict]]:
     """Return {(task, model): {method: {weighted_edge_counts, faithfulnesses}}}."""
     data: dict[tuple[str, str], dict[str, dict]] = defaultdict(dict)
+    abs_flag = "True" if use_abs else "False"
 
     for method in methods:
         for task in tasks:
@@ -51,7 +53,7 @@ def load_faithfulness_data(
                 path = os.path.join(
                     RESULTS_DIR,
                     f"{method}_patching_edge",
-                    f"{task}_{model}_test_abs-False.pkl",
+                    f"{task}_{model}_test_abs-{abs_flag}.pkl",
                 )
                 if not os.path.exists(path):
                     print(f"No result for: {method}, {task}, {model}. Skipping...")
@@ -87,7 +89,47 @@ def load_metric(
     if scores is None or variance is None:
         return None
     safe_denom = np.where(np.abs(scores) >= min_abs_score, np.abs(scores), 1.0)
-    return np.where(np.abs(scores) >= min_abs_score, variance / safe_denom, np.nan)
+    return np.where(np.abs(scores) >= min_abs_score, np.sqrt(variance) / safe_denom, np.nan)
+
+
+def apply_layer_mask(
+    metric: np.ndarray,
+    ignore_first: int | None,
+    ignore_last: int | None,
+) -> np.ndarray:
+    """Return metric with source rows / target cols for the first/last N layers set to NaN.
+
+    Source layout:  row 0 = embedding; layer L occupies rows 1+L*(n_heads+1) .. 1+(L+1)*(n_heads+1)-1
+    Target layout:  layer L occupies cols L*(3*n_heads+1) .. (L+1)*(3*n_heads+1)-1; last col = lm_head
+
+    ignore_first=N: always drops the embedding row; also drops the first N source/target layer slices.
+    ignore_last=N:  always drops the lm_head col;   also drops the last  N source/target layer slices.
+    Pass None to skip either side entirely.
+    """
+    n_forward, n_backward = metric.shape
+    n_layers, n_heads = infer_model_dims(n_forward, n_backward)
+    result = metric.copy()
+
+    src_per_layer = n_heads + 1
+    tgt_per_layer = 3 * n_heads + 1
+
+    if ignore_first is not None:
+        result[0, :] = np.nan                                    # embedding (always)
+        n = min(ignore_first, n_layers)
+        if n > 0:
+            result[1 : 1 + n * src_per_layer, :] = np.nan       # source rows for first n layers
+            result[:, 0 : n * tgt_per_layer] = np.nan            # target cols for first n layers
+
+    if ignore_last is not None:
+        result[:, n_layers * tgt_per_layer] = np.nan             # lm_head (always)
+        n = min(ignore_last, n_layers)
+        if n > 0:
+            start_src = 1 + (n_layers - n) * src_per_layer
+            start_tgt = (n_layers - n) * tgt_per_layer
+            result[start_src :, :] = np.nan                      # source rows for last n layers
+            result[:, start_tgt : n_layers * tgt_per_layer] = np.nan  # target cols for last n layers
+
+    return result
 
 
 def apply_top_percent_mask(

@@ -18,6 +18,8 @@ class Plotter(ABC):
         self.percent = args.percent
         self.use_abs = args.use_abs
         self.base_method = args.base_method
+        self.ignore_first = args.ignore_first
+        self.ignore_last = args.ignore_last
 
     @abstractmethod
     def plot(self):
@@ -86,6 +88,20 @@ def main() -> None:
         action="store_true",
         dest="use_abs",
         help="Rank edges by absolute score when applying --percent",
+    )
+    parser.add_argument(
+        "--ignore_first",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Drop the embedding and the first N layers (N=0 drops only the embedding)",
+    )
+    parser.add_argument(
+        "--ignore_last",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Drop the lm_head and the last N layers (N=0 drops only the lm_head)",
     )
     parser.add_argument(
         "--base_method",
