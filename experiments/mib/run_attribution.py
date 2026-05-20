@@ -134,8 +134,19 @@ def parse_args() -> argparse.Namespace:
         '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post'], default='post'
     )
     parser.add_argument(
+        '--norm-matching', dest='norm_matching', default=None,
+        choices=[None, 'source', 'target'],
+        help="Norm matching: 'source' scales baseline by source-residual norm ratio at source subtraction; "
+             "'target' scales by target-residual norm ratio at scoring time.",
+    )
+    parser.add_argument(
         '--variance-type', dest='variance_type', type=str,
         choices=['within', 'in_between', 'none'], default='in_between',
+    )
+    parser.add_argument(
+        '--cos-threshold', dest='cos_threshold', type=str,
+        choices=['none', 'hard', 'linear', 'tanh'], default='none',
+        help="Cosine-similarity noise floor thresholding applied to edge scores.",
     )
     parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
@@ -167,17 +178,15 @@ def _load_model_components(
     ).eval()
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    for layer in model.model.layers:
-        layer.post_attention_layernorm.norm_approx = None
-        layer.post_feedforward_layernorm.norm_approx = None
-
     adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=args.norm_approx)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
         variance_type=args.variance_type,
+        norm_matching=args.norm_matching,
         q_weight=args.weights[0], k_weight=args.weights[1], v_weight=args.weights[2],
         gate_weight=args.weights[3], up_weight=args.weights[4],
-        scale_loc=args.scale_loc
+        scale_loc=args.scale_loc,
+        cos_threshold=args.cos_threshold,
     )
     return tokenizer, adapter, tracer
 
