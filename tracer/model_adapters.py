@@ -8,14 +8,27 @@ from linear_transformer.modules.activations import SoftcapFN
 
 class ModelAdapter(ABC):
 
-    def __init__(self, model, ignore_norm: bool = False, norm_approx: str | None = None):
+    def __init__(self, model, ignore_norm: bool = False, frozen_norm: bool = False,
+                 final_softcap_fn: str = 'tanh', raw_edge_source: bool = False,
+                 ignore_softcap: bool = False):
         self.model = model
         self.config = model.config
         self.device = model.device
         self.dtype = model.dtype
 
         self.ignore_norm = ignore_norm
-        self.norm_approx = norm_approx
+        self.frozen_norm = frozen_norm
+        # Selects the activation used in Gemma2's final-logit softcap path.
+        # 'tanh' = standard autograd (current default, applies (1 - tanh^2) in backward).
+        # 'identity_tanh' = skips the softcap derivative (matches legacy eap_compat=False).
+        self.final_softcap_fn = final_softcap_fn
+        # If True (Gemma2 only), use RAW post-o_proj / post-down_proj as edge source,
+        # matching TransformerLens hook_z / hook_post — skips the post_attention_layernorm
+        # and post_feedforward_layernorm transforms on the source side.
+        self.raw_edge_source = raw_edge_source
+        # If True (Gemma2 only), drop final-logit softcap from forward entirely
+        # (logits = raw lm_head out, no cap·tanh wrapper). Matches DPEA "ignore softcap".
+        self.ignore_softcap = ignore_softcap
 
     @property
     def source_dims(self) -> int:
@@ -512,12 +525,6 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
     def residual_mid(self, layer: nn.Module) -> torch.Tensor:
         return layer.pre_feedforward_layernorm.input
 
-    def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
-        if self.norm_approx == 'dynamic_thr':
-            layer.pre_feedforward_layernorm.source.baseline_hidden_hook_0.output = baseline_tensor
-        elif self.norm_approx == 'dynamic_msk':
-            layer.pre_feedforward_layernorm.source.baseline_hidden_hook_1.output = mask
-
     @torch.no_grad()
     def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
         z = layer.self_attn.source.attention_interface_0.output[0].detach()
@@ -526,6 +533,10 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
         W_linear = layer.self_attn.o_proj.weight.data
         W_linear = W_linear.T.reshape(H, d, -1).detach()
         per_head_attn_out = torch.einsum('BSHd, HdD -> HBSD', z, W_linear).float()
+
+        # RAW post-o_proj per-head contribution (matches TL hook_z patching site).
+        if self.raw_edge_source:
+            return per_head_attn_out.to(z.dtype)
 
         # pass through norm
         W_norm = layer.post_attention_layernorm.weight.data
@@ -539,14 +550,20 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
 
     # mlp
     def mlp_out(self, layer: nn.Module) -> torch.Tensor:
+        if self.raw_edge_source:
+            return layer.mlp.output
         return layer.post_feedforward_layernorm.output
 
     # logits
     def logits(self):
         raw = self.model.lm_head.output
-        # cap = getattr(self.config, 'final_logit_softcapping', None)
-        # if cap is not None:
-        #     return SoftcapFN.apply(raw, cap)
+        if self.ignore_softcap:
+            return raw
+        cap = getattr(self.config, 'final_logit_softcapping', None)
+        if cap is not None:
+            from linear_transformer.modules import ACT_FN
+            tanh_fn = ACT_FN.get(self.final_softcap_fn, torch.tanh)
+            return tanh_fn(raw / cap) * cap
         return raw
 
     # graients

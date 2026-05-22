@@ -121,7 +121,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn-softcap-fn", default="tanh",
-        help="Gemma2 logit softcap rule (Rule 2). Key into ACT_FN.",
+        help="Gemma2 attn-logit softcap rule. Key into ACT_FN ('tanh' default; 'identity_tanh' skips softcap derivative).",
+    )
+    parser.add_argument(
+        "--final-softcap-fn", default="tanh",
+        help="Gemma2 final-logit softcap rule. Key into ACT_FN ('tanh' default; 'identity_tanh' skips softcap derivative).",
     )
     parser.add_argument(
         '--weights',
@@ -136,6 +140,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--variance-type', dest='variance_type', type=str,
         choices=['within', 'in_between', 'none'], default='in_between',
+    )
+    parser.add_argument(
+        '--raw-edge-source', dest='raw_edge_source', action='store_true', default=False,
+        help='(Gemma2 only) Use RAW post-o_proj / post-down_proj as edge source, matching TL hook_z / hook_post. '
+             'Skips the post_attention_layernorm and post_feedforward_layernorm transforms on the source side. '
+             'No-op for Llama/Qwen/GPT2 (their architectures have no post-norm wrapper).',
+    )
+    parser.add_argument(
+        '--ignore-softcap', dest='ignore_softcap', action='store_true', default=False,
+        help='(Gemma2 only) Drop attn-logit and final-logit softcap from forward entirely. '
+             'Matches DPEA-style "ignore softcap" (full removal, not just backward bypass). '
+             'No-op for non-Gemma2 models.',
     )
     parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
@@ -167,11 +183,10 @@ def _load_model_components(
     ).eval()
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    for layer in model.model.layers:
-        layer.post_attention_layernorm.norm_approx = None
-        layer.post_feedforward_layernorm.norm_approx = None
-
-    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=args.norm_approx)
+    adapter = adapter_cls(model, frozen_norm = lvp_kwargs['frozen_norm'], ignore_norm=args.ignore_norm,
+                          final_softcap_fn=args.final_softcap_fn,
+                          raw_edge_source=args.raw_edge_source,
+                          ignore_softcap=args.ignore_softcap)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
         variance_type=args.variance_type,
@@ -192,6 +207,7 @@ def run() -> None:
         "norm_approx": args.norm_approx,
         "attn_softcap_fn": args.attn_softcap_fn,
         "center_writing_weights": args.center_writing_weights,
+        "ignore_softcap": args.ignore_softcap,
     }
     if args.mlp_act_fn is not None:
         lvp_kwargs["mlp_act_fn"] = args.mlp_act_fn
