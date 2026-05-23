@@ -32,12 +32,14 @@ def main() -> None:
     from experiments.mib.visualization.plotters.faithfulness_curve import FaithfulnessCurve
     from experiments.mib.visualization.plotters.cv_histplot import CVHistplot
     from experiments.mib.visualization.plotters.barplot_by_component import BarplotByComponent
+    from experiments.mib.visualization.plotters.sdf_curve import SDFCurve
 
     plot_mapping = {
         "circuit_heatmap": {"type": "circuit", "cls": CircuitHeatmap},
         "faithfulness_curve": {"type": "results", "cls": FaithfulnessCurve},
         "cv_histplot": {"type": "circuit", "cls": CVHistplot},
         "component_barplot": {"type": "circuit", "cls": BarplotByComponent},
+        "sdf_curve": {"type": "results", "cls": SDFCurve},
     }
 
     parser = argparse.ArgumentParser(description="MIB visualization CLI")
@@ -45,7 +47,7 @@ def main() -> None:
         "plot_type",
         choices=plot_mapping.keys(),
         metavar="PLOT",
-        help="Which plot to generate (circuit_heatmap, faithfulness_curve, cv_histplot, component_barplot)",
+        help="Which plot to generate (circuit_heatmap, faithfulness_curve, cv_histplot, component_barplot, sdf_curve)",
     )
     parser.add_argument(
         "--methods",
@@ -108,6 +110,19 @@ def main() -> None:
         default=None,
         metavar="METHOD",
         help="Subtract this method's scores to plot the residual (method - base_method)",
+    )
+    parser.add_argument(
+        "--split",
+        choices=["train", "validation", "test"],
+        default="validation",
+        help="Dataset split used when loading SDF results (sdf_curve only)",
+    )
+    parser.add_argument(
+        "--x-axis",
+        choices=["percentage", "layer"],
+        default="percentage",
+        dest="x_axis",
+        help="What to put on the x-axis of the SDF plot (sdf_curve only)",
     )
     args = parser.parse_args()
 

@@ -93,20 +93,35 @@ if __name__ == "__main__":
                     print(f"  Warning: dataset has only {len(dataset)} examples, head={args.head} ignored.")
                 dataloader = dataset.dataloader(args.batch_size)
 
-                faithfulnesses, percentages, weighted_edge_counts = patcher.patch_circuit(dataloader, circuit_scores)
+                faithfulnesses, percentages, weighted_edge_counts, sdf_outside, sdf_inside = patcher.patch_circuit(dataloader, circuit_scores)
                 d = compute_metrics(faithfulnesses, percentages)
                 d["weighted_edge_counts"] = weighted_edge_counts
 
                 nm_prefix = "nm_" if args.norm_matching else ""
                 output_dir = os.path.join(args.output_dir, f"{nm_prefix}{method}")
                 os.makedirs(output_dir, exist_ok=True)
-                out_file = os.path.join(output_dir, f"{task}_{model_name}_{args.split}_abs-{args.absolute}.pkl")
+                stem = f"{task}_{model_name}_{args.split}_abs-{args.absolute}"
+                out_file = os.path.join(output_dir, f"{stem}.pkl")
+                sdf_file = os.path.join(output_dir, f"{stem}_sdf.pkl")
+
                 with open(out_file, 'wb') as f:
                     pickle.dump(d, f)
+
+                # sdf_outside / sdf_inside: list[n_percentages] of (n_samples, n_positions)
+                # n_positions = n_layers * 3  (in / mid / out per layer)
+                sdf_d = {
+                    "sdf_outside":  sdf_outside,
+                    "sdf_inside":   sdf_inside,
+                    "percentages":  percentages,
+                    "n_layers":     patcher.adapter.n_layers,
+                }
+                with open(sdf_file, 'wb') as f:
+                    pickle.dump(sdf_d, f)
 
                 print(
                     f"  -> {out_file}\n"
                     f"     area_under={d['area_under']:.4f}  "
                     f"area_from_1={d['area_from_1']:.4f}  "
-                    f"average={d['average']:.4f}"
+                    f"average={d['average']:.4f}\n"
+                    f"  -> {sdf_file}"
                 )

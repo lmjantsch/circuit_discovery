@@ -115,6 +115,31 @@ Circuits are represented as directed graphs where:
 
 Results are stored as `.pkl` files in `MIB-circuit-track/results/` and circuits as `.json` in `MIB-circuit-track/circuits/`.
 
+### Residual-State SDF Metric
+
+Computed alongside faithfulness by `patcher/patcher.py` and saved to `*_sdf.pkl` files. For each circuit size (percentage) and residual-stream position, it measures how the **patched** model's hidden state relates to the interval `[clean, baseline]` along each dimension.
+
+For a given residual position with patched state `c`, clean state `a`, and baseline state `b`:
+
+```
+m     = (a + b) / 2              # midpoint (per dimension)
+h     = |a - b| / 2              # half-width of the interval (per dimension)
+q     = |c - m| - h              # signed gap per dimension (> 0 outside, < 0 inside)
+h_rms = rms_d(h)                 # RMS half-width — shared scale for this position
+
+dist_outside = mean_d(max(q, 0) / h_rms)   # ≥ 0
+dist_inside  = mean_d(min(q, 0) / h_rms)   # ≤ 0
+```
+
+Values are in **units of RMS half-widths**, making them comparable across layers (later layers have larger absolute norms but the normalization cancels that out). Per-dimension division by `h_i` is avoided because dimensions where clean ≈ baseline have `h_i ≈ 0` and would blow up; the shared `h_rms` is always stable.
+
+**Interpretation:**
+- `dist_outside = 0.5` → the patched state exceeds the [clean, baseline] interval by half the typical interval width per dimension on average
+- `dist_inside = -0.3` → the patched state sits 30% of a typical half-width inside the interval per dimension on average
+- Both are 0 at 100% circuit (patched = clean, on the boundary) and at 0% (patched ≈ baseline, also on the boundary)
+
+SDF results are indexed as `sdf_outside[p_id]` / `sdf_inside[p_id]`, each a tensor of shape `(n_samples, n_layers * 3)`. The position axis maps as `layer * 3 + {0: in, 1: mid, 2: out}`. Visualised with `sdf_curve` in `experiments/mib/visualization/`.
+
 ### DPA Method (custom)
 
 The custom DPA implementation in `experiments/mib/run_attribution.py` uses backward passes to trace dual-path edge attributions without running the full EAP-IG pipeline. It produces score dicts consumed by `create_mib_circuite.py` to build the graph JSON independently of TransformerLens.

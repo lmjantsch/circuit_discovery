@@ -87,6 +87,8 @@ class EdgeCircuitPatcher:
     @contextmanager
     def circuit_context(self, circuit_scores: torch.Tensor):
         self.faithfulness_agg = [[] for _ in PERCENTAGES]
+        self.sdf_agg_outside = [[] for _ in PERCENTAGES]
+        self.sdf_agg_inside  = [[] for _ in PERCENTAGES]
         self.valid_edge_mask = self.get_valid_edge_mask()
         self.n_edges = self.valid_edge_mask.sum()
         self.forward_to_backward = self.get_forward_to_backward()
@@ -101,6 +103,8 @@ class EdgeCircuitPatcher:
             raise(e)
         finally:
             self.faithfulness_agg = None
+            self.sdf_agg_outside = None
+            self.sdf_agg_inside  = None
             self.valid_edge_mask = None
             self.n_edges = None
             self.forward_to_backward = None
@@ -139,28 +143,91 @@ class EdgeCircuitPatcher:
             faithfulness = [sum(s) / len(s) for s in self.faithfulness_agg]
             weighted_edge_counts = [int(self.n_edges * p) for p in PERCENTAGES]
 
-            return (faithfulness, PERCENTAGES, weighted_edge_counts)
+            sdf_outside = [torch.cat(lst, dim=0) for lst in self.sdf_agg_outside]
+            sdf_inside  = [torch.cat(lst, dim=0) for lst in self.sdf_agg_inside]
+
+            return (faithfulness, PERCENTAGES, weighted_edge_counts, sdf_outside, sdf_inside)
 
     def _process_batch(self, batch):
         with self.batch_context(batch), self.model.session():
-            
+
             with self.model.trace(**self._c_base_inputs):
                 self._cache_base()
-            
+
             with self.model.trace(**self._c_inputs):
                 self._cache_clean()
+
+            valid_mask = self._c_inputs['attention_mask'].bool()  # (B, S)
 
             for p_id, percentage in enumerate(PERCENTAGES[:-1]): # exlude 1.0
                 in_graph = self._get_in_graph(percentage)
                 in_graph = in_graph
                 with self.model.trace(**self._c_inputs):
                     patched_diff = self._cache_patched(in_graph)
-                
+
                 batch_score = (patched_diff - self._c_base_logit_diff) / (self._c_clean_logit_diff - self._c_base_logit_diff)
                 self.faithfulness_agg[p_id].extend(batch_score.tolist())
 
-            # set 1.0 for all 100% circuits
+                do, di = self._compute_sdf_all_positions(valid_mask)
+                self.sdf_agg_outside[p_id].append(do)
+                self.sdf_agg_inside[p_id].append(di)
+
+            # set 1.0 for all 100% circuits; at 100% patched=clean so SDF=0 everywhere
             self.faithfulness_agg[-1].extend([1 for _ in range(self._c_batch_size)])
+            n_pos = self.adapter.n_layers * 3
+            self.sdf_agg_outside[-1].append(torch.zeros(self._c_batch_size, n_pos))
+            self.sdf_agg_inside[-1].append(torch.zeros(self._c_batch_size, n_pos))
+
+    @staticmethod
+    def _to_tensor(x) -> torch.Tensor:
+        """Unwrap nnsight proxy to its concrete tensor value."""
+        return x.value if hasattr(x, 'value') else x
+
+    def _compute_sdf_all_positions(self, valid_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-sample SDF of patched residuals vs [clean, baseline] box.
+
+        The hyperrectangle is defined by corners a=clean and b=baseline.
+        SDF = dist_outside + dist_inside  (positive outside, negative inside, 0 on boundary).
+
+        valid_mask: (B, S) bool — True for non-padding positions
+        Returns: dist_outside (B, n_pos), dist_inside (B, n_pos) on CPU,
+                 where n_pos = n_layers * 3 (in / mid / out per layer).
+        """
+        B = self._c_batch_size
+        n_layers = self.adapter.n_layers
+        n_pos = n_layers * 3
+
+        outside = torch.zeros(B, n_pos)
+        inside  = torch.zeros(B, n_pos)
+        mask_f  = valid_mask.float().cpu()              # (B, S)
+        n_valid = mask_f.sum(dim=-1).clamp(min=1)       # (B,)
+
+        for layer_id in range(n_layers):
+            for pos_i, suffix in enumerate(('in', 'mid', 'out')):
+                key = f"{layer_id}.{suffix}"
+                c   = self._c_cache[key].float().cpu()       # (B, S, d)
+                a   = self._c_clean_cache[key].float().cpu() # (B, S, d)
+                b_t = self._c_base_cache[key].float().cpu()  # (B, S, d)
+
+                m = (a + b_t) * 0.5
+                h = (a - b_t).abs() * 0.5
+                q = (c - m).abs() - h                                          # (B, S, d)
+
+                # Normalise by the RMS half-width so values are in units of
+                # "typical interval half-widths" and are comparable across layers.
+                # Per-dimension division is avoided because dims where clean≈baseline
+                # have h≈0 and would blow up; the shared RMS scale is always stable.
+                h_rms = h.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)  # (B, S, 1)
+                q_rel = q / h_rms                                              # (B, S, d)
+
+                do = q_rel.clamp(min=0).mean(dim=-1)                          # (B, S)
+                di = q_rel.clamp(max=0).mean(dim=-1)                          # (B, S)  ≤ 0
+
+                idx = layer_id * 3 + pos_i
+                outside[:, idx] = (do * mask_f).sum(dim=-1) / n_valid
+                inside[:, idx]  = (di * mask_f).sum(dim=-1) / n_valid
+
+        return outside, inside
 
     def _update_source_cache(self, new_tensor: torch.Tensor, source_cache: torch.Tensor, type: str, layer_id: int = None):
         source_slice = self.adapter.get_src_slice(type=type, layer_id=layer_id)

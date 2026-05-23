@@ -154,6 +154,32 @@ def apply_top_percent_mask(
     return result
 
 
+def load_sdf_data(
+    methods: list[str],
+    tasks: list[str],
+    models: list[str],
+    split: str = "validation",
+    use_abs: bool = False,
+) -> dict[tuple[str, str], dict[str, dict]]:
+    """Return {(task, model): {method: sdf_dict}} loaded from *_sdf.pkl files."""
+    data: dict[tuple[str, str], dict[str, dict]] = defaultdict(dict)
+    abs_flag = "True" if use_abs else "False"
+    for method in methods:
+        for task in tasks:
+            for model in models:
+                path = os.path.join(
+                    RESULTS_DIR,
+                    method,
+                    f"{task}_{model}_{split}_abs-{abs_flag}_sdf.pkl",
+                )
+                if not os.path.exists(path):
+                    print(f"No SDF data for: {method}, {task}, {model}. Skipping...")
+                    continue
+                with open(path, "rb") as fh:
+                    data[(task, model)][method] = pickle.load(fh)
+    return data
+
+
 def save_figure(fig: plt.Figure, out_path: str, dpi: int = 150) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
