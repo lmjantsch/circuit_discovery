@@ -21,9 +21,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from nnsight import NNsight
 
 from experiments.mib.data_utils import MIBDataset, create_mib_circuit
-from linear_transformer import patch_model_for_lvp
-from tracer.model_adapters import Llama2ModelAdapter, Gemma2ModelAdapter, GPT2ModelAdapter, ModelAdapter
-from tracer.tracer import EdgeCircuitTracer
+from modular_transformer import patch_model_for_lvp
+from modular_transformer.models import GPT2_ARC, LLAMA2_ARC, GEMMA2_ARC
+from adapters import Llama2ModelAdapter, Gemma2ModelAdapter, GPT2ModelAdapter, ModelAdapter
+from tracer import EdgeCircuitTracer
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -44,6 +45,13 @@ MIB_MODEL_TO_ADAPTER_CLS: dict[str, type | None] = {
     "qwen2.5": Llama2ModelAdapter,
     "llama3": Llama2ModelAdapter,
     "gemma2": Gemma2ModelAdapter,
+}
+
+MIB_MODEL_TO_ARC: dict[str, type | None] = {
+    "gpt2": GPT2_ARC,
+    "qwen2.5": LLAMA2_ARC,
+    "llama3": LLAMA2_ARC,
+    "gemma2": GEMMA2_ARC,
 }
 
 DEFAULT_BATCH_SIZES: dict[str, int] = {
@@ -113,25 +121,11 @@ def parse_args() -> argparse.Namespace:
         help="Norm approximation mode: None=original, frozen=detach denominator, dynamic_thr=threshold-based, dynamic_msk=input-ID mask.",
     )
     parser.add_argument(
-        "--ignore-norm", dest="ignore_norm", action="store_true", default=False,
-        help="Ignores norms on backward pass",
-    )
-    parser.add_argument(
         "--center-writing-weights", dest="center_writing_weights", action="store_true", default=False,
     )
     parser.add_argument(
         "--attn-softcap-fn", default="tanh",
         help="Gemma2 logit softcap rule (Rule 2). Key into ACT_FN.",
-    )
-    parser.add_argument(
-        '--weights',
-        type=float,
-        nargs=5,
-        default=[1.0, 1.0, 1.0, 1.0, 1.0],
-        help='Provide exactly 5 float values (q_weight, k_weight, v_weight, gate_weight, up_weight)'
-    )
-    parser.add_argument(
-        '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post'], default='post'
     )
     parser.add_argument(
         '--norm-matching', dest='norm_matching', default=None,
@@ -142,11 +136,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--variance-type', dest='variance_type', type=str,
         choices=['within', 'in_between', 'none'], default='in_between',
-    )
-    parser.add_argument(
-        '--cos-threshold', dest='cos_threshold', type=str,
-        choices=['none', 'hard', 'linear', 'tanh'], default='none',
-        help="Cosine-similarity noise floor thresholding applied to edge scores.",
     )
     parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
@@ -178,15 +167,13 @@ def _load_model_components(
     ).eval()
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=args.norm_approx)
+    adapter = adapter_cls(model, MIB_MODEL_TO_ARC[model_name], frozen_norm=args.norm_approx=='frozen')
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
+        use_counterfactual=args.use_counterfactual,
+        integration_steps=args.integration_steps,
         variance_type=args.variance_type,
         norm_matching=args.norm_matching,
-        q_weight=args.weights[0], k_weight=args.weights[1], v_weight=args.weights[2],
-        gate_weight=args.weights[3], up_weight=args.weights[4],
-        scale_loc=args.scale_loc,
-        cos_threshold=args.cos_threshold,
     )
     return tokenizer, adapter, tracer
 
@@ -247,7 +234,7 @@ def run() -> None:
         dataloader = dataset.dataloader(batch_size)
         logger.info("  %d examples, %d batches", len(dataset), len(dataloader))
 
-        (scores, variance) = tracer.build_circuit(dataloader, use_counterfactual=args.use_counterfactual, integration_steps=args.integration_steps)
+        (scores, variance) = tracer.build_circuit(dataloader)
         circuit = create_mib_circuit(scores, adapter.n_layers, adapter.n_heads, adapter.model_dim)
 
         os.makedirs(circuit_dir, exist_ok=True)
