@@ -4,7 +4,6 @@ import torch
 from torch import nn
 
 from tracer.modeling_utils import apply_inverse_rope
-from linear_transformer.modules.activations import SoftcapFN
 
 class ModelAdapter(ABC):
 
@@ -119,6 +118,10 @@ class ModelAdapter(ABC):
     def build_attn_source(self, layer) -> None:
         pass
 
+    @abstractmethod
+    def build_mlp_source(self, layer) -> None:
+        pass
+
     # attention
     @abstractmethod
     def query_out(self, layer: nn.Module) -> torch.Tensor:
@@ -130,6 +133,30 @@ class ModelAdapter(ABC):
 
     @abstractmethod
     def value_out(self, layer: nn.Module) -> torch.Tensor:
+        pass
+    
+    @abstractmethod
+    def qv_matmul(self, layer: nn.Module) -> tuple:
+        pass
+
+    @abstractmethod
+    def qv_context(self, layer: nn.Module, context: dict):
+        pass
+    
+    @abstractmethod
+    def av_matmul(self, layer: nn.Module) -> tuple:
+        pass
+
+    @abstractmethod
+    def av_context(self, layer: nn.Module, context: dict):
+        pass
+
+    @abstractmethod
+    def attn_softmax_input(self, layer: nn.Module) -> torch.Tensor:
+        pass
+
+    @abstractmethod
+    def attn_softmax_context(self, layer: nn.Module, context: dict) -> None:
         pass
 
     @abstractmethod
@@ -143,6 +170,22 @@ class ModelAdapter(ABC):
 
     @abstractmethod
     def up_out(self, layer: nn.Module) -> torch.Tensor:
+        pass
+    
+    @abstractmethod
+    def gu_mul(self, layer: nn.Module) -> tuple:
+        pass
+
+    @abstractmethod
+    def gu_context(self, layer: nn.Module, context: dict):
+        pass
+
+    @abstractmethod
+    def gate_act_input(self, layer: nn.Module) -> torch.Tensor | None:
+        pass
+
+    @abstractmethod
+    def gate_act_context(self, layer: nn.Module, context: dict) -> None:
         pass
 
     @abstractmethod
@@ -325,6 +368,9 @@ class Llama2ModelAdapter(ModelAdapter):
     def build_attn_source(self, layer: nn.Module) -> None:
         layer.self_attn.source
 
+    def build_mlp_source(self, layer: nn.Module) -> None:
+        layer.mlp.source
+
     # attention
     def query_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.self_attn.q_proj.output
@@ -334,8 +380,29 @@ class Llama2ModelAdapter(ModelAdapter):
 
     def value_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.self_attn.source.attention_interface_0.source.repeat_kv_1.output
+    
+    def qv_matmul(self, layer: nn.Module) -> tuple:
+        (x, y), _ = layer.self_attn.source.attention_interface_0.source.module_matmul_fn_0.inputs
+        return (x.detach(), y.detach())
+    
+    def qv_context(self, layer: nn.Module, context: dict):
+        layer.self_attn.source.attention_interface_0.source.module_matmul_fn_0.source.fwd_context_hook_0.output = context
+    
+    def av_matmul(self, layer: nn.Module) -> tuple:
+        (x, y), _ =  layer.self_attn.source.attention_interface_0.source.module_matmul_fn_1.inputs
+        return (x.detach(), y.detach())
+    
+    def av_context(self, layer: nn.Module, context: dict):
+        layer.self_attn.source.attention_interface_0.source.module_matmul_fn_1.source.fwd_context_hook_0.output = context
 
-    @torch.no_grad() 
+    def attn_softmax_input(self, layer: nn.Module) -> torch.Tensor:
+        (x,), _ = layer.self_attn.source.attention_interface_0.source.module_attn_act_fn_0.inputs
+        return x.detach()
+
+    def attn_softmax_context(self, layer: nn.Module, context: dict) -> None:
+        layer.self_attn.source.attention_interface_0.source.module_attn_act_fn_0.source.fwd_context_hook_0.output = context
+
+    @torch.no_grad()
     def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
         z = layer.self_attn.source.attention_interface_0.output[0].detach()
         _, _, H, d = z.shape
@@ -350,6 +417,20 @@ class Llama2ModelAdapter(ModelAdapter):
 
     def up_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.mlp.up_proj.output
+    
+    def gu_mul(self, layer: nn.Module) -> tuple:
+        (x, y), _ =  layer.mlp.source.self_mul_fn_0.inputs
+        return (x.detach(), y.detach())
+    
+    def gu_context(self, layer: nn.Module, context: dict):
+        layer.mlp.source.self_mul_fn_0.source.fwd_context_hook_0.output = context
+
+    def gate_act_input(self, layer: nn.Module) -> torch.Tensor:
+        (x,), _ = layer.mlp.source.self_act_fn_0.inputs
+        return x.detach()
+
+    def gate_act_context(self, layer: nn.Module, context: dict) -> None:
+        layer.mlp.source.self_act_fn_0.source.fwd_context_hook_0.output = context
 
     def mlp_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.mlp.output
@@ -357,7 +438,7 @@ class Llama2ModelAdapter(ModelAdapter):
     # logits
     def logits(self):
         return self.model.lm_head.output
-    
+
 
     # graients
     def mlp_in_grad(
@@ -543,11 +624,13 @@ class Gemma2ModelAdapter(Llama2ModelAdapter):
 
     # logits
     def logits(self):
-        raw = self.model.lm_head.output
-        # cap = getattr(self.config, 'final_logit_softcapping', None)
-        # if cap is not None:
-        #     return SoftcapFN.apply(raw, cap)
-        return raw
+        logits = self.model.lm_head.output
+        cap = getattr(self.config, 'final_logit_softcapping', None)
+        if cap is not None:
+            logits = logits / self.config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.final_logit_softcapping
+        return logits
 
     # graients
     def mlp_in_grad(
@@ -689,6 +772,9 @@ class GPT2ModelAdapter(ModelAdapter):
     def build_attn_source(self, layer: nn.Module) -> None:
         layer.attn.source
 
+    def build_mlp_source(self, layer: nn.Module) -> None:
+        layer.mlp.source
+
     # attention
     def query_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.attn.source.split_1.output[0]
@@ -698,8 +784,29 @@ class GPT2ModelAdapter(ModelAdapter):
 
     def value_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.attn.source.transpose_3.output
+    
+    def qv_matmul(self, layer: nn.Module) -> tuple:
+        (x, y), _ = layer.attn.source.attention_interface_0.source.module_matmul_fn_0.inputs
+        return (x.detach(), y.detach())
+    
+    def qv_context(self, layer: nn.Module, context: dict):
+        layer.attn.source.attention_interface_0.source.module_matmul_fn_0.source.fwd_context_hook_0.output = context
 
-    @torch.no_grad() 
+    def av_matmul(self, layer: nn.Module) -> tuple:
+        (x, y), _ = layer.attn.source.attention_interface_0.source.module_matmul_fn_1.inputs
+        return (x.detach(), y.detach())
+    
+    def av_context(self, layer: nn.Module, context: dict):
+        layer.attn.source.attention_interface_0.source.module_matmul_fn_1.source.fwd_context_hook_0.output = context
+
+    def attn_softmax_input(self, layer: nn.Module) -> torch.Tensor:
+        (x,), _ = layer.attn.source.attention_interface_0.source.module_attn_act_fn_0.inputs
+        return x.detach()
+
+    def attn_softmax_context(self, layer: nn.Module, context: dict) -> None:
+        layer.attn.source.attention_interface_0.source.module_attn_act_fn_0.source.fwd_context_hook_0.output = context
+
+    @torch.no_grad()
     def per_head_attn_out(self, layer: nn.Module) -> torch.Tensor:
         z = layer.attn.source.attention_interface_0.output[0].detach()
         _, _, H, d = z.shape
@@ -718,13 +825,26 @@ class GPT2ModelAdapter(ModelAdapter):
 
     def mlp_in(self, layer: nn.Module) -> torch.Tensor:
         return layer.mlp.input
+    
+    def gu_mul(self, layer: nn.Module) -> tuple:
+        return (None, None)
+    
+    def gu_context(self, layer: nn.Module, context: dict):
+        pass
+
+    def gate_act_input(self, layer: nn.Module) -> torch.Tensor:
+        (x,), _ = layer.mlp.source.self_act_fn_0.inputs
+        return x.detach()
+
+    def gate_act_context(self, layer: nn.Module, context: dict) -> None:
+        layer.mlp.source.self_act_fn_0.source.fwd_context_hook_0.output = context
 
     def mlp_out(self, layer: nn.Module) -> torch.Tensor:
         return layer.mlp.output
 
     # logits
     def logits(self):
-        return self.model.lm_head.output 
+        return self.model.lm_head.output
 
     # graients
     def mlp_in_grad(

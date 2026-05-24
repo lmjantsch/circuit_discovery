@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from tracer.model_adapters import ModelAdapter
+from .modeling_utils import calculate_theta
 
 VARIANCE_TYPES = ('within', 'in_between', 'none')
 NORM_MATCHING_TYPES = (None, 'source', 'target')
@@ -49,6 +50,7 @@ class EdgeCircuitTracer:
         self.cache = {}
         self.source_cache = None   # shape: [source_dims, B, S, d]
         self.baseline_cache = {}
+        self.activation_cache = {}
         self.baseline_source_cache = None
         self.disable_source_caching = False
 
@@ -107,7 +109,7 @@ class EdgeCircuitTracer:
 
                 if use_counterfactual == True or integration_steps > 1:
                     with self.model.trace(**corrupt_inputs):
-                        self._forward_pass_and_cache()
+                        self._forward_pass_and_cache(is_baseline=True)
                     self.corrupt_embeds = self.cache['emb'].detach().clone()
                     self.baseline_cache = {f'{i}.{k}': self.cache[f'{i}.{k}'] for i in range(self.adapter.n_layers) for k in ['mid', 'out']}
                     self.baseline_cache[f'-1.out'] = self.cache['-1.out']
@@ -164,10 +166,11 @@ class EdgeCircuitTracer:
     def empty_cache(self):
         self.cache = {}
         self.baseline_cache = {}
+        self.activation_cache = {}
         self.source_cache = None
         self.baseline_source_cache = None
 
-    def _forward_pass_and_cache(self, integrated_embeds: torch.Tensor | None = None):
+    def _forward_pass_and_cache(self, integrated_embeds: torch.Tensor | None = None, is_baseline: bool = False):
         B, S, d = self.curr_batch_size, self.curr_seq_len, self.adapter.model_dim  # (B, S, d)
 
         if integrated_embeds is not None:
@@ -194,6 +197,16 @@ class EdgeCircuitTracer:
             self.cache[f'{layer_id}.key_out'] = self.adapter.key_out(layer)
             self.cache[f'{layer_id}.value_out'] = self.adapter.value_out(layer)
 
+            if is_baseline:
+                self.activation_cache[f"{layer_id}.qv_matmul"] = self.adapter.qv_matmul(layer)
+                self.activation_cache[f"{layer_id}.attn_act"] = self.adapter.attn_softmax_input(layer)
+                self.activation_cache[f"{layer_id}.av_matmul"] = self.adapter.av_matmul(layer)
+            else:
+                theta = calculate_theta(self.cache[f"{layer_id - 1}.out"], self.baseline_cache[f"{layer_id - 1}.out"])
+                self.adapter.qv_context(layer, {"x_base": self.activation_cache[f"{layer_id}.qv_matmul"][0], "y_base": self.activation_cache[f"{layer_id}.qv_matmul"][1], "x_theta": theta.unsqueeze(1), "y_theta": theta.unsqueeze(1).transpose(-2, -1)})
+                self.adapter.attn_softmax_context(layer, {"x_base": self.activation_cache[f"{layer_id}.attn_act"], "theta": theta.unsqueeze(1)})
+                self.adapter.av_context(layer, {"x_base": self.activation_cache[f"{layer_id}.av_matmul"][0], "y_base": self.activation_cache[f"{layer_id}.av_matmul"][1], "y_theta": theta.unsqueeze(1), "is_av_matmul": True})
+
             self._update_source_cache(
                 self.adapter.per_head_attn_out(layer).detach().reshape(self.adapter.n_heads, B, S, d),
                 type='attn', layer_id=layer_id)
@@ -203,8 +216,18 @@ class EdgeCircuitTracer:
             if self.adapter.norm_approx in ('dynamic_thr', 'dynamic_msk') and self.baseline_cache:
                 self.adapter.ln_2_baseline_hook(layer, self.baseline_cache[f'{layer_id}.mid'], self.curr_id_mask)
 
+            self.adapter.build_mlp_source(layer)
             self.cache[f'{layer_id}.gate_out'] = self.adapter.gate_out(layer)
             self.cache[f'{layer_id}.up_out'] = self.adapter.up_out(layer)
+
+            if is_baseline:
+                self.activation_cache[f"{layer_id}.mlp_act"] = self.adapter.gate_act_input(layer)
+                self.activation_cache[f"{layer_id}.gu_mul"] = self.adapter.gu_mul(layer)
+            else:
+                theta = calculate_theta(self.cache[f"{layer_id}.mid"], self.baseline_cache[f"{layer_id}.mid"])
+                self.adapter.gate_act_context(layer, {"x_base": self.activation_cache[f"{layer_id}.mlp_act"], "theta": theta})
+                self.adapter.gu_context(layer, {"x_base": self.activation_cache[f"{layer_id}.gu_mul"][0], "y_base": self.activation_cache[f"{layer_id}.gu_mul"][1], "theta": theta})
+
             self._update_source_cache(
                 self.adapter.mlp_out(layer).detach().reshape(1, B, S, d), type='mlp', layer_id=layer_id)
 

@@ -174,7 +174,7 @@ def _load_model_components(
     dtype = torch.bfloat16 if model_id != 'gpt2' else torch.float
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto",
+        model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto", 
     ).eval()
     model = patch_model_for_lvp(model, **lvp_kwargs)
 

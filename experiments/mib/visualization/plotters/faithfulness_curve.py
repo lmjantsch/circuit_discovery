@@ -14,7 +14,7 @@ class FaithfulnessCurve(Plotter):
         for (task, model) in data:
             fig = self._plot_faithfulness(data[(task, model)], f"{task} — {model}")
 
-            out_path = os.path.join(PLOTS_DIR, 'faithfulness_curve', f"{task}_{model}.png")
+            out_path = os.path.join(PLOTS_DIR, 'faithfulness_curve', f"{task}_{model}{'_abs' if self.use_abs else ''}.png")
             save_figure(fig, out_path)
 
     def _plot_faithfulness(self, method_data: dict[str, dict], title: str) -> Figure:

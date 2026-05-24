@@ -1,7 +1,6 @@
 import os
 import sys
 
-os.environ['CUDA_VISIBLE_DEVICES']='0'
 proj_path = '/home/dacslab/lasse_jantsch/circuit_discovery'
 if proj_path not in sys.path:
     sys.path.insert(0, proj_path)
