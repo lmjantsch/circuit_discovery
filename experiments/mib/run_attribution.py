@@ -138,20 +138,19 @@ def parse_args() -> argparse.Namespace:
         '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post'], default='post'
     )
     parser.add_argument(
+        '--norm-matching', dest='norm_matching', default=None,
+        choices=[None, 'source', 'target'],
+        help="Norm matching: 'source' scales baseline by source-residual norm ratio at source subtraction; "
+             "'target' scales by target-residual norm ratio at scoring time.",
+    )
+    parser.add_argument(
         '--variance-type', dest='variance_type', type=str,
         choices=['within', 'in_between', 'none'], default='in_between',
     )
     parser.add_argument(
-        '--raw-edge-source', dest='raw_edge_source', action='store_true', default=False,
-        help='(Gemma2 only) Use RAW post-o_proj / post-down_proj as edge source, matching TL hook_z / hook_post. '
-             'Skips the post_attention_layernorm and post_feedforward_layernorm transforms on the source side. '
-             'No-op for Llama/Qwen/GPT2 (their architectures have no post-norm wrapper).',
-    )
-    parser.add_argument(
-        '--ignore-softcap', dest='ignore_softcap', action='store_true', default=False,
-        help='(Gemma2 only) Drop attn-logit and final-logit softcap from forward entirely. '
-             'Matches DPEA-style "ignore softcap" (full removal, not just backward bypass). '
-             'No-op for non-Gemma2 models.',
+        '--cos-threshold', dest='cos_threshold', type=str,
+        choices=['none', 'hard', 'linear', 'tanh'], default='none',
+        help="Cosine-similarity noise floor thresholding applied to edge scores.",
     )
     parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
@@ -183,16 +182,19 @@ def _load_model_components(
     ).eval()
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    adapter = adapter_cls(model, frozen_norm = lvp_kwargs['frozen_norm'], ignore_norm=args.ignore_norm,
-                          final_softcap_fn=args.final_softcap_fn,
-                          raw_edge_source=args.raw_edge_source,
-                          ignore_softcap=args.ignore_softcap)
+    for layer in model.model.layers:
+        layer.post_attention_layernorm.norm_approx = None
+        layer.post_feedforward_layernorm.norm_approx = None
+
+    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=args.norm_approx)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
         variance_type=args.variance_type,
+        norm_matching=args.norm_matching,
         q_weight=args.weights[0], k_weight=args.weights[1], v_weight=args.weights[2],
         gate_weight=args.weights[3], up_weight=args.weights[4],
-        scale_loc=args.scale_loc
+        scale_loc=args.scale_loc,
+        cos_threshold=args.cos_threshold,
     )
     return tokenizer, adapter, tracer
 
