@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import pickle
 import argparse
 
@@ -27,15 +28,23 @@ DEFAULT_OUTPUT_DIR  = os.path.join(proj_path, 'experiments/mib/results')
 def compute_metrics(faithfulnesses: list[float], percentages: tuple) -> dict:
     area_under = 0.
     area_from_1 = 0.
+    log_area_under = 0.
+    log_area_from_1 = 0.
     for i in range(len(faithfulnesses) - 1):
         x1, x2 = percentages[i], percentages[i + 1]
         y1, y2 = faithfulnesses[i], faithfulnesses[i + 1]
         w = x2 - x1
         area_under  += w * (y1 + y2) / 2
         area_from_1 += w * (abs(1. - y1) + abs(1. - y2)) / 2
+        if x1 > 0 and x2 > 0:
+            log_w = math.log(x2) - math.log(x1)
+            log_area_under  += log_w * (y1 + y2) / 2
+            log_area_from_1 += log_w * (abs(1. - y1) + abs(1. - y2)) / 2
     return {
         "area_under":      area_under,
         "area_from_1":     area_from_1,
+        "log_area_under":  log_area_under,
+        "log_area_from_1": log_area_from_1,
         "average":         sum(faithfulnesses) / len(faithfulnesses),
         "faithfulnesses":  faithfulnesses,
     }
@@ -108,5 +117,7 @@ if __name__ == "__main__":
                     f"  -> {out_file}\n"
                     f"     area_under={d['area_under']:.4f}  "
                     f"area_from_1={d['area_from_1']:.4f}  "
-                    f"average={d['average']:.4f}"
+                    f"average={d['average']:.4f}\n"
+                    f"     log_area_under={d['log_area_under']:.4f}  "
+                    f"log_area_from_1={d['log_area_from_1']:.4f}"
                 )
