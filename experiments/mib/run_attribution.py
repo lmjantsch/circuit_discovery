@@ -109,8 +109,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--norm-approx", dest="norm_approx", default=None,
-        choices=[None, "frozen", "dynamic_thr", "dynamic_msk"],
-        help="Norm approximation mode: None=original, frozen=detach denominator, dynamic_thr=threshold-based, dynamic_msk=input-ID mask.",
+        choices=[None, "frozen", "dynamic_thr", "dynamic_msk", "ig"],
+        help="Norm approximation mode: None=original, frozen=detach denominator, dynamic_thr=threshold-based, dynamic_msk=input-ID mask, ig=baseline sigma.",
+    )
+    parser.add_argument(
+        "--grad-norm-approx", dest="grad_norm_approx", default=None,
+        choices=[None, "frozen", "dynamic_thr", "dynamic_msk", "ig"],
+        help="Overrides --norm-approx for the LVP wrapper only.",
+    )
+    parser.add_argument(
+        "--score-norm-approx", dest="score_norm_approx", default=None,
+        choices=[None, "frozen", "dynamic_thr", "dynamic_msk", "ig"],
+        help="Overrides --norm-approx for the model adapter only.",
     )
     parser.add_argument(
         "--ignore-norm", dest="ignore_norm", action="store_true", default=False,
@@ -131,7 +141,7 @@ def parse_args() -> argparse.Namespace:
         help='Provide exactly 5 float values (q_weight, k_weight, v_weight, gate_weight, up_weight)'
     )
     parser.add_argument(
-        '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post'], default='post'
+        '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post', 'score'], default='post'
     )
     parser.add_argument(
         '--norm-matching', dest='norm_matching', default=None,
@@ -149,7 +159,15 @@ def parse_args() -> argparse.Namespace:
         help="Cosine-similarity noise floor thresholding applied to edge scores.",
     )
     parser.add_argument(
+        "--abs", dest="abs_scores", action="store_true", default=False,
+        help="Aggregate |score| instead of score; saves scores_abs.pt and variance_*_abs.pt.",
+    )
+    parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--no-softcap", dest="no_softcap", action="store_true", default=False,
+        help="Disable softcapping: sets model.config.attn_logit_softcapping and final_logit_softcapping to None.",
     )
     return parser.parse_args()
 
@@ -174,11 +192,15 @@ def _load_model_components(
     dtype = torch.bfloat16 if model_id != 'gpt2' else torch.float
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto", 
+        model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto",
     ).eval()
+    if args.no_softcap:
+        model.config.attn_logit_softcapping = None
+        model.config.final_logit_softcapping = None
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=args.norm_approx)
+    score_norm = args.score_norm_approx if args.score_norm_approx is not None else args.norm_approx
+    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=score_norm)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
         variance_type=args.variance_type,
@@ -187,6 +209,7 @@ def _load_model_components(
         gate_weight=args.weights[3], up_weight=args.weights[4],
         scale_loc=args.scale_loc,
         cos_threshold=args.cos_threshold,
+        abs_scores=args.abs_scores,
     )
     return tokenizer, adapter, tracer
 
@@ -198,7 +221,7 @@ def run() -> None:
         "attn_act_fn": args.attn_act_fn,
         "matmul_fn": args.matmul_fn,
         "mul_fn": args.mul_fn,
-        "norm_approx": args.norm_approx,
+        "norm_approx": args.grad_norm_approx if args.grad_norm_approx is not None else args.norm_approx,
         "attn_softcap_fn": args.attn_softcap_fn,
         "center_writing_weights": args.center_writing_weights,
     }
@@ -250,12 +273,13 @@ def run() -> None:
         (scores, variance) = tracer.build_circuit(dataloader, use_counterfactual=args.use_counterfactual, integration_steps=args.integration_steps)
         circuit = create_mib_circuit(scores, adapter.n_layers, adapter.n_heads, adapter.model_dim)
 
+        abs_suffix = "_abs" if args.abs_scores else ""
         os.makedirs(circuit_dir, exist_ok=True)
         with open(os.path.join(circuit_dir, 'importances.json'), "w") as f:
             json.dump(circuit, f, indent=2)
-        torch.save(scores, os.path.join(circuit_dir, 'scores.pt'))
+        torch.save(scores, os.path.join(circuit_dir, f'scores{abs_suffix}.pt'))
         if variance != None:
-            torch.save(variance, os.path.join(circuit_dir, f'variance_{args.variance_type}.pt'))
+            torch.save(variance, os.path.join(circuit_dir, f'variance_{args.variance_type}{abs_suffix}.pt'))
          
         logger.info("  Done in %.1fs — saved %s", time.time() - t0, circuit_dir)
 

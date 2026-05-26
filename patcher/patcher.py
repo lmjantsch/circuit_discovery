@@ -130,22 +130,76 @@ class EdgeCircuitPatcher:
             self._empty_cache()
 
 
-    def patch_circuit(self, dataloader: DataLoader, circuit_scores):
+    def patch_circuit(self, dataloader: DataLoader, circuit_scores, return_residual_stats: bool = False):
+        self._residual_stats_agg = [[] for _ in PERCENTAGES[:-1]] if return_residual_stats else None
         with self.circuit_context(circuit_scores):
             for batch in tqdm(dataloader):
                 self._process_batch(batch)
 
-            faithfulness = [sum(s) / len(s) for s in self.faithfulness_agg]
+            # Drop non-finite per-sample faithfulness scores before averaging.
+            # A sample whose denominator (clean_metric - corrupt_metric) rounds to 0
+            # in bf16 yields +/-inf (e.g. 1 of 1188 arc_easy samples); excluding it
+            # keeps the mean finite without changing the other samples' scores.
+            def _finite_mean(s):
+                finite = [x for x in s if x == x and x not in (float('inf'), float('-inf'))]
+                return (sum(finite) / len(finite)) if finite else float('nan')
+            faithfulness = [_finite_mean(s) for s in self.faithfulness_agg]
             weighted_edge_counts = [int(self.n_edges * p) for p in PERCENTAGES]
+            result = (faithfulness, PERCENTAGES, weighted_edge_counts)
 
-            return (faithfulness, PERCENTAGES, weighted_edge_counts)
+            if return_residual_stats:
+                stats = {
+                    p: (torch.cat([t[0] for t in tensors], dim=1),
+                        torch.cat([t[1] for t in tensors], dim=1))
+                    for p, tensors in zip(PERCENTAGES[:-1], self._residual_stats_agg)
+                }
+                self._residual_stats_agg = None
+                return result, stats
+
+            return result
+
+    def _collect_residual_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compare patched vs clean pre-attention residuals per layer.
+
+        Returns a pair (cf_stats, post_cf_stats), each (n_layers, N, 2):
+          x = cos_sim * norm_ratio,  y = sin * norm_ratio.
+        cf_stats covers positions where clean ≠ base tokens.
+        post_cf_stats covers positions after the first change that are still identical.
+        """
+        clean_ids = self._c_inputs['input_ids']       # (B, S)
+        base_ids  = self._c_base_inputs['input_ids']  # (B, S_base)
+        B, S = clean_ids.shape
+
+        if base_ids.shape == clean_ids.shape:
+            cf_mask      = (clean_ids != base_ids)                                # (B, S)
+            first_change = cf_mask.int().argmax(dim=-1)                           # (B,)
+            post_cf_mask = torch.arange(S, device=clean_ids.device)[None, :] > first_change[:, None]  # (B, S)
+            post_cf_mask[cf_mask] = False
+            post_cf_mask[~self._c_inputs['attention_mask'].bool()] = False
+            post_cf_mask[~cf_mask.any(dim=-1)] = False  # skip rows with no change
+        else:
+            cf_mask      = self._c_inputs['attention_mask'].bool()
+            post_cf_mask = torch.zeros(B, S, dtype=torch.bool)
+
+        cf_rows, post_rows = [], []
+        for layer_id in range(self.adapter.n_layers):
+            clean   = self._c_clean_cache[f"{layer_id}.in"]    # (B, S, d_model)
+            patched = self._c_cache[f"{layer_id}.in"]           # (B, S, d_model)
+            norm_ratio = patched.norm(dim=-1) / clean.norm(dim=-1).clamp(min=1e-8)  # (B, S)
+            cos = torch.cosine_similarity(patched, clean, dim=-1)                    # (B, S)
+            sin = (1 - cos.clamp(-1, 1) ** 2).sqrt()                                # (B, S)
+            xy  = torch.stack([cos * norm_ratio, sin * norm_ratio], dim=-1)         # (B, S, 2)
+            cf_rows.append(xy[cf_mask].cpu())        # (N_cf, 2)
+            post_rows.append(xy[post_cf_mask].cpu()) # (N_post, 2)
+
+        return torch.stack(cf_rows), torch.stack(post_rows)  # each (n_layers, N, 2)
 
     def _process_batch(self, batch):
         with self.batch_context(batch), self.model.session():
-            
+
             with self.model.trace(**self._c_base_inputs):
                 self._cache_base()
-            
+
             with self.model.trace(**self._c_inputs):
                 self._cache_clean()
 
@@ -154,9 +208,12 @@ class EdgeCircuitPatcher:
                 in_graph = in_graph
                 with self.model.trace(**self._c_inputs):
                     patched_diff = self._cache_patched(in_graph)
-                
+
                 batch_score = (patched_diff - self._c_base_logit_diff) / (self._c_clean_logit_diff - self._c_base_logit_diff)
                 self.faithfulness_agg[p_id].extend(batch_score.tolist())
+
+                if self._residual_stats_agg is not None:
+                    self._residual_stats_agg[p_id].append(self._collect_residual_stats())
 
             # set 1.0 for all 100% circuits
             self.faithfulness_agg[-1].extend([1 for _ in range(self._c_batch_size)])

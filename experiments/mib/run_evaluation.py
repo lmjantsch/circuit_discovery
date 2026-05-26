@@ -87,7 +87,8 @@ if __name__ == "__main__":
 
         for method in args.methods:
             for task in args.tasks:
-                circuit_path = os.path.join(args.circuit_dir, method, f"{task}_{model_name}", 'scores.pt')
+                scores_file = 'scores_abs.pt' if args.absolute else 'scores.pt'
+                circuit_path = os.path.join(args.circuit_dir, method, f"{task}_{model_name}", scores_file)
                 if not os.path.exists(circuit_path):
                     print(f"Circuit not found, skipping: {circuit_path}")
                     continue

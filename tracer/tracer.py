@@ -20,7 +20,7 @@ class EdgeCircuitTracer:
                  variance_type: str = 'in_between', norm_matching: str | None = None,
                  q_weight: float = 1.0, k_weight: float = 1.0, v_weight: float = 1.0,
                  gate_weight: float = 1.0, up_weight: float = 1.0, scale_loc: str = 'post',
-                 cos_threshold: str = 'none'):
+                 cos_threshold: str = 'none', abs_scores: bool = False):
         assert variance_type in VARIANCE_TYPES, f"variance_type must be one of {VARIANCE_TYPES}"
         assert norm_matching in NORM_MATCHING_TYPES, f"norm_matching must be one of {NORM_MATCHING_TYPES}"
         assert cos_threshold in COS_THRESHOLD_TYPES, f"cos_threshold must be one of {COS_THRESHOLD_TYPES}"
@@ -42,6 +42,7 @@ class EdgeCircuitTracer:
         self.up_weight = up_weight
         self.scale_loc = scale_loc
         self.cos_threshold = cos_threshold
+        self.abs_scores = abs_scores
 
         self.circuit_scores = None
         self.circuit_scores_m2 = None
@@ -189,7 +190,7 @@ class EdgeCircuitTracer:
 
         for layer_id, layer in enumerate(self.adapter.layers):
 
-            if self.adapter.norm_approx in ('dynamic_thr', 'dynamic_msk') and self.baseline_cache:
+            if self.adapter.norm_approx in ('dynamic_thr', 'dynamic_msk', 'ig') and self.baseline_cache:
                 self.adapter.ln_1_baseline_hook(layer, self.baseline_cache[f'{layer_id - 1}.out'], self.curr_id_mask)
 
             self.adapter.build_attn_source(layer)  # call to build source
@@ -213,7 +214,7 @@ class EdgeCircuitTracer:
 
             self.cache[f'{layer_id}.mid'] = self.adapter.residual_mid(layer).detach()
 
-            if self.adapter.norm_approx in ('dynamic_thr', 'dynamic_msk') and self.baseline_cache:
+            if self.adapter.norm_approx in ('dynamic_thr', 'dynamic_msk', 'ig') and self.baseline_cache:
                 self.adapter.ln_2_baseline_hook(layer, self.baseline_cache[f'{layer_id}.mid'], self.curr_id_mask)
 
             self.adapter.build_mlp_source(layer)
@@ -361,6 +362,8 @@ class EdgeCircuitTracer:
 
         n_real = self.curr_attention_mask.sum(dim=-1).float().to(self.cache_device)  # [B]
         per_token_scores = per_sample_scores / n_real[:, None, None]                 # [B, n_src, n_tgt], μ_b
+        if self.abs_scores:
+            per_token_scores = per_token_scores.abs()
 
         # --- Running mean update (per-token normalised) ---
         batch_mean = per_token_scores.mean(dim=0)
@@ -375,6 +378,8 @@ class EdgeCircuitTracer:
         if self.variance_type == 'within':
             # [B, S, n_src, n_tgt]: per-position attribution scores
             per_pos = torch.einsum('ibsd,jbsd->bsij', sources, grad).to(self.cache_device).detach()
+            if self.abs_scores:
+                per_pos = per_pos.abs()
             mask = self.curr_attention_mask.to(self.cache_device).float()            # [B, S]
             masked_mean = (per_pos * mask[:, :, None, None]).sum(dim=1) / n_real[:, None, None]  # [B, n_src, n_tgt]
             sq_dev = ((per_pos - masked_mean.unsqueeze(1)) * mask[:, :, None, None]) ** 2        # [B, S, n_src, n_tgt]
@@ -433,5 +438,7 @@ class EdgeCircuitTracer:
 
         if scale_loc == 'post':
             grad_tensor.grad = weight * grad_tensor.grad
+        elif scale_loc == 'score':
+            detached_grad = weight * detached_grad
 
         return detached_grad
