@@ -136,7 +136,14 @@ class EdgeCircuitPatcher:
             for batch in tqdm(dataloader):
                 self._process_batch(batch)
 
-            faithfulness = [sum(s) / len(s) for s in self.faithfulness_agg]
+            # Drop non-finite per-sample faithfulness scores before averaging.
+            # A sample whose denominator (clean_metric - corrupt_metric) rounds to 0
+            # in bf16 yields +/-inf (e.g. 1 of 1188 arc_easy samples); excluding it
+            # keeps the mean finite without changing the other samples' scores.
+            def _finite_mean(s):
+                finite = [x for x in s if x == x and x not in (float('inf'), float('-inf'))]
+                return (sum(finite) / len(finite)) if finite else float('nan')
+            faithfulness = [_finite_mean(s) for s in self.faithfulness_agg]
             weighted_edge_counts = [int(self.n_edges * p) for p in PERCENTAGES]
 
             return (faithfulness, PERCENTAGES, weighted_edge_counts)
