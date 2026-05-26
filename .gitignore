@@ -16,3 +16,9 @@ experiments/mib/MIB-circuit-track/
 # Files
 .log
 test.ipynb
+.codex
+.omx
+experiments/mib/method_comparison/stability
+experiments/mib/component_ap
+experiments/mib/results_new_patcher
+experiments/mib/circuits_new_patcher
