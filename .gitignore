@@ -5,7 +5,9 @@ circuits/
 __pycache__/
 plots/
 scripts/
-
+_circuits/
+data_exploration_jaccard/
+results/
 
 # Files
 .log
