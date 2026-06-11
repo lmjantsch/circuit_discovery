@@ -152,6 +152,20 @@ def method_flags(method: str, model: str) -> list[str]:
             "--mul-fn",
             "bilinear_mul",
         ]
+    if method == "eap_frnorm_secantmlp_bilinear_ig5":
+        mlp_act = "secant_silu" if model in {"qwen2.5", "llama3"} else "secant_gelu_tanh"
+        return [
+            "--norm-approx",
+            "frozen",
+            "--mlp-act-fn",
+            mlp_act,
+            "--matmul-fn",
+            "bilinear_matmul",
+            "--mul-fn",
+            "bilinear_mul",
+            "--integration-steps",
+            "5",
+        ]
     raise SystemExit(f"Unsupported method preset: {method}")
 
 
@@ -388,19 +402,24 @@ def aggregate_stability(
         smethod = split_method_name(method, start, end)
         score_path = circuits_dir / smethod / f"{task}_{model}" / "scores.pt"
         result_path = results_dir / smethod / f"{task}_{model}_test_abs-False.pkl"
-        if not score_path.exists() or not result_path.exists():
-            print(f"[stability skip] missing {score_path} or {result_path}", flush=True)
+        if not score_path.exists():
+            print(f"[stability skip] missing {score_path}", flush=True)
             return
         scores.append(torch.load(score_path, map_location="cpu").float())
-        with result_path.open("rb") as f:
-            faithfulnesses.append(torch.tensor(pickle.load(f)["faithfulnesses"], dtype=torch.float32))
+        if result_path.exists():
+            with result_path.open("rb") as f:
+                faithfulnesses.append(torch.tensor(pickle.load(f)["faithfulnesses"], dtype=torch.float32))
 
     stack = torch.stack(scores)
     score_mean = stack.mean(dim=0)
     score_std = stack.std(dim=0, unbiased=len(scores) > 1)
-    faith_stack = torch.stack(faithfulnesses)
-    faith_mean = faith_stack.mean(dim=0)
-    faith_std = faith_stack.std(dim=0, unbiased=len(faithfulnesses) > 1)
+    if len(faithfulnesses) == len(scores):
+        faith_stack = torch.stack(faithfulnesses)
+        faith_mean = faith_stack.mean(dim=0)
+        faith_std = faith_stack.std(dim=0, unbiased=len(faithfulnesses) > 1)
+    else:
+        faith_mean = torch.full((len(PERCENTAGES),), float("nan"))
+        faith_std = torch.full((len(PERCENTAGES),), float("nan"))
 
     out_dir = stability_dir / method / f"{task}_{model}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -541,7 +560,7 @@ def main() -> None:
                         smethod = split_method_name(method, start, end)
                         score_path = circuits_dir / smethod / f"{task}_{model}" / "scores.pt"
                         result_path = results_dir / smethod / f"{task}_{model}_{args.eval_split}_abs-False.pkl"
-                        if score_path.exists() and result_path.exists():
+                        if score_path.exists() and (args.skip_evaluation or result_path.exists()):
                             completed_ranges.append((start, end))
                     if len(completed_ranges) < 2:
                         print(

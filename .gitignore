@@ -18,7 +18,9 @@ experiments/mib/MIB-circuit-track/
 test.ipynb
 .codex
 .omx
-experiments/mib/method_comparison/stability
+experiments/mib/method_comparison
+experiments/mib/data_exploration_jaccard
 experiments/mib/component_ap
+experiments/mib/cv_analysis
 experiments/mib/results_new_patcher
 experiments/mib/circuits_new_patcher
