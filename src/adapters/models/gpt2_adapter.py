@@ -3,9 +3,9 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from adapters.adapter import ModelAdapter, LayerAdapter
+from ..adapter import ModelAdapter, LayerAdapter
 
-from adapters.utils import head_wise_backwards, head_wise_forward_qkv
+from ..utils import head_wise_backwards, head_wise_forward_qkv
 
 
 class GPT2LayerAdapter(LayerAdapter):

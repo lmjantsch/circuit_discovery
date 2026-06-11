@@ -11,14 +11,13 @@ if proj_path not in sys.path:
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from modular_transformer import patch_model_for_lvp
+from modular_transformer import patch_model
 from experiments.mib.data_utils import MIBDataset
-from patcher.patcher import (
+from src.patcher import (
     EdgeCircuitPatcher,
     MIB_MODEL_TO_HF_ID,
     MIB_MODEL_TO_ADAPTER_CLS,
     MIB_MODEL_TO_ARC,
-    PERCENTAGES,
 )
 
 DEFAULT_CIRCUIT_DIR = os.path.join(proj_path, 'experiments/mib/circuits')
@@ -80,7 +79,7 @@ if __name__ == "__main__":
         model = AutoModelForCausalLM.from_pretrained(
             model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto",
         ).eval()
-        model = patch_model_for_lvp(model, norm_approx='frozen')
+        model = patch_model(model, norm_approx='frozen')
 
         adapter = MIB_MODEL_TO_ADAPTER_CLS[model_name](model, MIB_MODEL_TO_ARC[model_name], frozen_norm=False)
         patcher = EdgeCircuitPatcher(adapter, tokenizer, norm_matching=args.norm_matching)

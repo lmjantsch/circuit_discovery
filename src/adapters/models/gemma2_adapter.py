@@ -3,9 +3,9 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from adapters.models.llama2_adapter import Llama2ModelAdapter, Llama2LayerAdapter
+from .llama2_adapter import Llama2ModelAdapter, Llama2LayerAdapter
 
-from adapters.utils import head_wise_forward
+from ..utils import head_wise_forward
 
 
 class Gemma2LayerAdapter(Llama2LayerAdapter):

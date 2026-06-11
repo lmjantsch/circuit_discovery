@@ -14,10 +14,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
 
-from modular_transformer import patch_model_for_lvp
+from modular_transformer import patch_model
 from modular_transformer.models import GPT2_ARC, LLAMA2_ARC, GEMMA2_ARC
-from experiments.mib.data_utils import MIBDataset
-from adapters import GPT2ModelAdapter, Gemma2ModelAdapter, Llama2ModelAdapter, ModelAdapter
+from src.adapters import GPT2ModelAdapter, Gemma2ModelAdapter, Llama2ModelAdapter, ModelAdapter
 
 
 MIB_MODEL_TO_HF_ID: dict[str, str] = {

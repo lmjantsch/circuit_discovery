@@ -21,10 +21,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from nnsight import NNsight
 
 from experiments.mib.data_utils import MIBDataset, create_mib_circuit
-from modular_transformer import patch_model_for_lvp
+from modular_transformer import patch_model
 from modular_transformer.models import GPT2_ARC, LLAMA2_ARC, GEMMA2_ARC
-from adapters import Llama2ModelAdapter, Gemma2ModelAdapter, GPT2ModelAdapter, ModelAdapter
-from tracer import EdgeCircuitTracer
+from src.adapters import Llama2ModelAdapter, Gemma2ModelAdapter, GPT2ModelAdapter, ModelAdapter
+from src.tracer import EdgeCircuitTracer
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--integration-steps", type=int, default=1,
                         help="Number of integration steps for IG-style attribution (1 = plain gradient).")
 
-    # patch_model_for_lvp kwargs
+    # patch_model kwargs
     parser.add_argument(
         "--attn-act-fn", default="softmax",
         help="Attention softmax rule (Rule 3). Key into ACT_FN, e.g. dtd_softmax, sec_jac_softmax.",
@@ -117,15 +117,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--norm-approx", dest="norm_approx", default=None,
-        choices=[None, "frozen", "dynamic_thr", "dynamic_msk"],
-        help="Norm approximation mode: None=original, frozen=detach denominator, dynamic_thr=threshold-based, dynamic_msk=input-ID mask.",
+        choices=[None, "frozen"],
+        help="Norm approximation mode: None=original, frozen=detach denominator",
     )
-    parser.add_argument(
-        "--center-writing-weights", dest="center_writing_weights", action="store_true", default=False,
-    )
-    parser.add_argument(
-        "--attn-softcap-fn", default="tanh",
-        help="Gemma2 logit softcap rule (Rule 2). Key into ACT_FN.",
+    parser.add_argument( # TODO: implement
+        "--no-softcap", dest="no_sofrcap", action="store_true", default=False,
+        help="Deactivates softcap in Gemma2",
     )
     parser.add_argument(
         '--norm-matching', dest='norm_matching', default=None,
@@ -165,7 +162,7 @@ def _load_model_components(
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto",
     ).eval()
-    model = patch_model_for_lvp(model, **lvp_kwargs)
+    model = patch_model(model, **lvp_kwargs)
 
     adapter = adapter_cls(model, MIB_MODEL_TO_ARC[model_name], frozen_norm=args.norm_approx=='frozen')
     tracer = EdgeCircuitTracer(

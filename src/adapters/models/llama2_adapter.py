@@ -3,8 +3,8 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from adapters.adapter import ModelAdapter, LayerAdapter
-from adapters.utils import head_wise_backwards, head_wise_forward_qkv, apply_inverse_rope, apply_rope
+from ..adapter import ModelAdapter, LayerAdapter
+from ..utils import head_wise_backwards, head_wise_forward_qkv, apply_inverse_rope, apply_rope
 
 
 class Llama2LayerAdapter(LayerAdapter):

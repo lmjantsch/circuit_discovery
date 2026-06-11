@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
-from adapters import ModelAdapter
+from .adapters import ModelAdapter
 
 VARIANCE_TYPES = ('within', 'in_between', 'none')
 NORM_MATCHING_TYPES = (None, 'source', 'target')

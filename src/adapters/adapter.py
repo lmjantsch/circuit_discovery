@@ -7,7 +7,7 @@ from torch import nn
 from transformers import AutoModelForCausalLM
 
 from modular_transformer.models import ArchAccessors
-from adapters.utils import head_wise_forward
+from .utils import head_wise_forward
 
 class ModelAdapter(ABC):
 
