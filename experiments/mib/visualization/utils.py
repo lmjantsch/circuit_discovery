@@ -52,7 +52,7 @@ def load_faithfulness_data(
             for model in models:
                 path = os.path.join(
                     RESULTS_DIR,
-                    f"{method}_patching_edge",
+                    method,
                     f"{task}_{model}_test_abs-{abs_flag}.pkl",
                 )
                 if not os.path.exists(path):
