@@ -8,6 +8,8 @@ scripts/
 _circuits/
 data_exploration_jaccard/
 results/
+.claude/
+.pytest_cache/
 
 # Files
 .log
