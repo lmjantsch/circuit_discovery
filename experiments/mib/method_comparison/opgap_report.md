@@ -135,6 +135,35 @@ EAP score 에 가해지는 보정이다 (midpoint/secant = 경로 평균 Jacobia
 읽는 법: **EAP op-gap = 1차가 놓치는 2차항의 상대 크기. 모듈 op-gap = 모듈 적용 후 남는 오차.**
 모듈 op-gap ≈ 0 = 모듈이 그 op 의 2차항을 정확히 메움.
 
+### 3.4 완전 noise budget — 미보정 비선형(softmax, softcap) 포함
+
+"왜 이 세 곳을 골랐나"에 답하려면 **모듈이 안 푸는 비선형까지** 정량화해야 한다. softmax·softcap 추가:
+
+| 비선형 op | gpt2 EAP op-gap | gemma2 EAP op-gap | corrector | 보정 후 |
+|---|---|---|---|---|
+| **softmax** | **1.4592** | **1.1198** | IG (Z-step) | Z=5: 0.0106 / 0.0074 |
+| Q@K (bilinear) | 0.6591 | 0.8260 | midpoint (1×) | ~1e-6 |
+| GELU (MLP act) | 0.7182 | 0.5947 | secant (1×) | ~1e-7 |
+| GeGLU gate·up (bilinear) | — | 0.6843 | midpoint (1×) | ~1e-7 |
+| A@V (bilinear) | 0.2656 | 0.1480 | midpoint (1×) | ~1e-7 |
+| Norm (LN/RMS) | 0.2482 | 0.3110 | freeze | LN 0.656 / RMS 0.108 |
+| softcap (gemma tanh) | — | 0.0057 | secant (1×) | 7.2e-10 |
+
+**softmax IG 수렴** (gpt2 / gemma2):
+
+| | EAP tangent | IG Z=1 | Z=2 | Z=5 | Z=10 | Z=20 |
+|---|---|---|---|---|---|---|
+| gpt2 | 1.4592 | 0.4080 | 0.1232 | 0.0106 | 0.0022 | 0.0005 |
+| gemma2 | 1.1198 | 0.3757 | 0.0829 | 0.0074 | 0.0017 | 0.0004 |
+
+**핵심 — 잡음원이 두 부류로 갈린다:**
+- **closed-form exact (1× 비용)**: bilinear(Q@K·A@V·GeGLU)=midpoint, MLP-act(GELU)=secant, softcap=secant → 모듈이 1-step 에 정확히(≈1e-7) 제거. **이 셋을 고른 이유 = closed-form 으로 공짜 정확 보정 가능.**
+- **integration-only (Z× 비용)**: softmax = **최대 잡음원(1.1~1.5)인데 closed-form 없음** (multi-D 결합) → Z-step IG 필요 (1.46→0.011 @Z=5). = `--integration-steps`(eap_ig_5) 로 처리.
+- **norm**: freeze, 아키텍처 의존.
+- **negligible**: softcap(0.006) — 거의 선형, 사실상 무시가능.
+
+→ CPR 최강 method `eap_ig_5_igbilin_frnorm_secmlp` 는 우연이 아니라 **4개 잡음원 클래스를 각 올바른 도구로 커버**: ig_5→softmax, igbilin→bilinear, secmlp→GELU, frnorm→norm.
+
 ---
 
 ## 4. 결과 분석
@@ -167,6 +196,14 @@ EAP score 에 가해지는 보정이다 (midpoint/secant = 경로 평균 Jacobia
 - **현대 RMSNorm 아키텍처(gemma/qwen/llama)에선 세 모듈 모두 자기 op-gap 을 줄인다** → gemma2 의 CPR gain 이
   GPT-2 보다 훨씬 큰 이유와 일관 (추가 GeGLU bilinear op + RMSNorm 에서 FrLN 작동).
 
+### 4.4b 잡음원 선택의 원리 (§3.4 budget 기반)
+
+- **softmax 가 최대 잡음원**(1.1~1.5, 1.0 초과 = 오차 > 참변화, 극도로 포화)이지만 element-wise/bilinear 가
+  아니라 **closed-form exact corrector 가 없다.** → Z-step IG 로만 보정(1.46→0.011 @Z=5), 즉 Z× 비용.
+- 우리 세 모듈이 겨눈 bilinear·MLP-act·softcap 은 **1× 비용에 정확 보정** 가능 (midpoint/secant 가 대수적 exact).
+  → **"왜 이 셋"의 답: 크기(상위) + closed-form tractability.** softmax 는 IG(integration-steps)로 상보적으로 처리.
+- 전체 method 조합이 budget 으로 설명됨: ig_5(softmax) + igbilin(bilinear) + secmlp(GELU) + frnorm(norm).
+
 ### 4.4 한계 (정직하게)
 
 - op-gap 은 **op 하나의 비선형을 isolate** 한 지표. op 출력이 downstream 비선형을 통과하며 받는 추가 왜곡
@@ -187,5 +224,7 @@ EAP score 에 가해지는 보정이다 (midpoint/secant = 경로 평균 Jacobia
 | `scripts/oplevel_fn_gap_gpt2_ioi.py` | GPT-2 LayerNorm |
 | `scripts/oplevel_gap_gemma2_ioi.py` | gemma2 GeGLU·gelu·RMSNorm |
 | `scripts/oplevel_attn_gap_gemma2_ioi.py` | gemma2 Q@K·A@V (rotary+GQA+softcap) |
+| `scripts/oplevel_softmax_gpt2_ioi.py` | GPT-2 softmax (EAP tangent + IG Z=1..20) |
+| `scripts/oplevel_softmax_gemma2_ioi.py` | gemma2 softmax + softcap |
 
 (참고: single-edge ε / joint-AP / SM-verify 는 별도 실험 — edge 샘플링 기반, op-gap 과 다름.)
