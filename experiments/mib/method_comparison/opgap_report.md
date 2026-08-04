@@ -14,7 +14,8 @@ EAP(1차 테일러 근사)와 golden AP 사이의 갭 = **각 비선형 op 의 2
 1. **single-edge AP 는 EAP 의 정의상 정답**이다 — EAP score = single-edge AP 의 1차 선형화. 그러니
    single-edge 를 reference 로 쓰면 EAP 가 구조적으로 1등이고, 어떤 모듈도 못 이긴다 (검증틀이 EAP 에 유리).
 2. logit-level 에서 잰 갭은 **두 종류가 섞여 있다**:
-   - **self 고차항** (single edge 가 아래로 전파되며 겪는 자기 비선형 = self-repair). top edge 에서 갭의 ~95%.
+   - **self 고차항** (single edge 가 아래로 전파되며 겪는 자기 비선형 = self-repair). 갭의 대부분을 차지
+     (component ablation 56%, 2-edge joint 50%; single edge 는 섭동이 작아 20~31% — §1a-정정 참조).
    - **cross/곡률 2차항** (op 에서 두 입력이 동시에 움직일 때 / 비선형 곡률). 모듈이 겨누는 것.
    self-repair 가 모듈이 겨누는 2차항을 덮어버려 "갭 못 메움"으로 나왔다.
 
@@ -73,8 +74,26 @@ op 별로 역산이 안 되는지**가 여기서 나온다.
 - **backup head (Hydra effect)**: 주 head 를 끊으면 억제돼 있던 head 가 기능을 대신함
 
 실측(component ablation): `|net_frozen| 1.226 → |net_real| 1.113`, **LN 매개 self-repair ≈ 0.156 (효과의 ~14%)**.
-전체 1차 오차는 component 수준 56%, top edge 95%.
+EAP 1차가 남기는 총 상대오차는 **component ablation 56%**, **2-edge joint 50%**, **single edge 20~31%**
+— 섭동이 클수록 커진다(§1a-정정).
 근사 오차가 아니라 **실제 모델 행동**이며, 여러 op 을 거친 기능적 대체라 **국소 Jacobian 보정으론 못 잡는다.**
+
+### ⚠ 정정 — 이전 "상대오차 ~95%" 는 단위 아티팩트였다
+
+`tracer.py:_update_scores` 는 `per_sample_scores / n_real` 로 **score 를 토큰 수로 나눈다**(per-token 정규화).
+반면 golden AP 는 총효과다. IOI 평균 프롬프트 길이 **T = 16.35** (최소제곱 slope 17.28 로 확인) 만큼 단위가 어긋나
+`ε = |score − I_AP| ≈ |I_AP|` 가 되어버렸다.
+
+**결정적 증거**: 미보정 상대오차가 **표본·기법 무관하게 0.943~0.984 로 일정** — 근사 품질이 아니라 단위 격차를 잰 것.
+
+| 표본 (EAP) | 미보정 | **×T 보정** |
+|---|---|---|
+| PILOT decile-9 (옛 "0.93" 출처) | 0.9478 | **0.2027** |
+| GLOBAL random (무편향 모집단) | 0.9484 | **0.2897** |
+| GLOBAL union top-200 | 0.9500 | **0.3140** |
+
+→ 이 문서에서 **single-edge / joint-AP 의 "95%" 서술은 모두 정정**되었다.
+**op-gap 은 영향 없음** — score 를 쓰지 않고 활성 텐서끼리의 무차원 비율이라 단위가 약분된다(7개 스크립트 모두 확인).
 
 ### 왜 스칼라에서 역산이 불가능한가
 
@@ -107,15 +126,37 @@ op 별로 역산이 안 되는지**가 여기서 나온다.
 
 **결과 (GPT-2/IOI, 100 CF쌍)**
 
-| method | mean ε | Spearman(score, I_AP) | win-rate vs EAP |
+| method | mean ε (미보정) | Spearman(score, I_AP) | win-rate vs EAP |
 |---|---|---|---|
 | **EAP** | **0.00601** | **0.9613** | — |
 | +FrozenNorm | 0.00600 | 0.8491 | 0.490 |
 | +SecantMLP | 0.00603 | 0.8368 | 0.355 |
 | +Bilinear | 0.00613 | 0.7780 | 0.083 |
 
-**분석**: 모든 slice(ε·ranking·component)에서 EAP 1위. decile-9(top edge)가 mean ε 의 96%를 지배하고
-거기서 정규화 ε ≈ 0.93~0.99 → **top edge 에서 1차 근사가 상대오차 ~100%로 붕괴**.
+**분석**: 모든 slice(ε·ranking·component)에서 EAP 1위.
+(주의: 위 ε 절대값은 단위 미보정이라 크기 자체는 무의미하다 — §1a-정정. 기법 간 비교는 모두 같은 관례를
+공유하므로 **paired 로는 유효**하다.)
+
+**A-2. 표본 편향 검증 + 무편향 재측정** (`compute_iap_global_gpt2_ioi.py`)
+
+위 V 는 EAP `|score|` 로 층화했으므로 EAP 에 유리할 수 있다. 이를 없앤 표본으로 재측정:
+**랜덤 1000개**(전 유효 edge 균등 = 모집단 무편향) + **4기법 top-200 union 285개**(어느 기법도 자기 top edge 를
+뺏기지 않음). 단위는 ×T 보정.
+
+| 표본 | method | mean ε | ε/\|I_AP\| | win vs EAP | Spearman |
+|---|---|---|---|---|---|
+| **랜덤(무편향)** | **EAP** | **0.00072** | **0.290** | — | **0.9713** |
+| n=1000 | +FrLN | 0.00082 | 0.330 | 0.259 | 0.8110 |
+| | +SM | 0.00109 | 0.439 | 0.248 | 0.8421 |
+| | +Bilinear | 0.00186 | 0.746 | 0.127 | 0.7649 |
+| **union top-200** | **EAP** | **0.07202** | **0.314** | — | **0.9332** |
+| n=285 | +FrLN | 0.07848 | 0.342 | 0.460 | 0.9076 |
+| | +SM | 0.07558 | 0.329 | 0.333 | 0.9200 |
+| | +Bilinear | 0.14057 | 0.613 | 0.189 | 0.8105 |
+
+→ **표본 편향은 원인이 아니었다** (무편향 랜덤에서도 순위 동일). 그리고 단위 보정 후 EAP 의 상대오차는
+**0.29~0.31** — 즉 이 regime 에서 **1차가 이미 ~70% 를 설명**한다. 고칠 여지 자체가 작다.
+부수 관찰: union 표본에서 FrLN 의 Pearson 0.9186 > EAP 0.8016 (mean ε 는 근소 열세이나 선형 대응은 우위).
 
 ### B. 선행 실험 ②: joint AP (2-edge) (`compute_joint_ap_gpt2_ioi.py`)
 
@@ -126,23 +167,32 @@ op 별로 역산이 안 되는지**가 여기서 나온다.
 
 **결과**
 
+(모든 score 는 ×T 단위 보정 적용.)
+
 | | coupled (n=120) | control (n=120) |
 |---|---|---|
 | golden \|C\| | **0.00976 (joint 의 10.1%)** | 0.00112 (1.2%) |
-| EAP \|sum−I_joint\| | **0.09210** | 0.09195 |
-| midpoint \|sum−I_joint\| | 0.09275 | 0.09251 |
+| EAP \|sum·T−I_joint\| | **0.04790 (\|I_joint\| 의 49.6%)** | 0.04807 (50.0%) |
+| midpoint \|sum·T−I_joint\| | 0.05131 | 0.05337 |
+| win vs EAP — static / midpoint | 0.317 / 0.392 | 0.275 / 0.325 |
 | cross 회수 r(Δ, C) — static / midpoint | **+0.538 / +0.454** | −0.108 / −0.074 |
-| win vs EAP — static / midpoint | 0.350 / 0.467 | 0.083 / 0.133 |
+| 보정 크기 mean\|Δ\|/mean\|C\| — static / midpoint | **7.01× / 3.07×** | (대상 없음) |
 
 **분석**: (1) coupled 의 cross 가 control 의 **8.7배** → 설계 검증. (2) 모듈의 Δ 가 **coupled 에서만** C 와
-상관 → **메커니즘(무엇을 겨누는지)은 검증됨**. (3) 그러나 크기는 1/3만 포착(slope 3.11), win-rate < 0.5 →
-**오차를 못 줄임**. 이유: `|EAP sum − I_joint| / |I_joint| = 95.4%` — self-repair 가 cross(10%)를 덮음.
+상관(+0.45~0.54, control ≈ 0) → **메커니즘(무엇을 겨누는지)은 검증됨**. (3) 그러나 **크기가 과하다** —
+midpoint 의 보정 크기가 golden cross 의 **3.07배**(static 은 7.01배). 방향은 맞고 크기가 넘쳐 win-rate < 0.5.
+그리고 남은 미보정 잔차가 `|EAP sum·T − I_joint| / |I_joint| = 49.6%` 로 cross(10.1%)보다 훨씬 커서,
+cross 를 완벽히 고쳐도 총오차 변화가 묻힌다.
+
+> 정정: 이전 판의 "cross 를 1/3만 포착(slope 3.11)"·"95.4%" 는 단위 미보정에서 나온 값이었다.
+> 또한 회귀 slope 은 방향에 따라 1.05~5.6배로 흔들려(`r=0.45` 감쇠) 크기 주장의 근거로 부적합하므로,
+> 방향-무관 지표인 **스케일 비 `mean|Δ|/mean|C|`** 로 대체했다.
 
 ### C. 두 실험의 한계 — 왜 **잡음원 진단**이 안 되나
 
 1. **총합 하나만 나온다.** logit 에서의 오차는 *경로 위 모든 op 의 선형화 오차 + downstream 혼합 +
    self-repair* 의 합. 이 스칼라를 다시 op 별로 쪼갤 방법이 없다 → **"어느 op 에서 얼마"를 못 얻음**.
-2. **지배항이 대상을 덮는다.** 겨누는 cross 는 10%, 미보정 잔차는 95%. 대상을 완벽히 고쳐도 총오차 변화가
+2. **지배항이 대상을 덮는다.** 겨누는 cross 는 joint 의 10.1%, 미보정 잔차는 49.6%. 대상을 완벽히 고쳐도 총오차 변화가
    측정 노이즈에 묻힌다 (실측: midpoint 가 방향은 맞혔는데 절대거리는 오히려 미세 악화).
 3. **single-edge 엔 그 항이 아예 없다.** `Δ(Q@Kᵀ) = ΔQ·Kᵀ + Q·ΔKᵀ + ΔQ·ΔKᵀ` 에서 operand 하나만 움직이므로
    `ΔK = 0` → **cross ≡ 0**. 일어나지 않는 현상은 진단할 수 없다.
@@ -190,7 +240,8 @@ op-gap 으로 만든 noise budget(§3.4)이 두 가지를 동시에 알려준다
 - **② downstream 혼합·증폭**: 국소 보정은 그 op 의 오차만 없앨 뿐, 그 뒤 경로에서의 증폭·op 간 결합은 그대로.
 - **③ self-repair**: 여러 op 을 거친 **기능적 대체**(backup head 등)라 국소 Jacobian 교체로는 접근 불가.
   (FrLN 이 norm 매개 self-repair 와 같은 항을 건드리지만, 실측상 실제 모델 대비 오차를 줄이지 못함 — §4.2.)
-- 이 ②③ 잔차가 곧 **logit-level 오차의 ~95%** 이고, op-gap≈0 이 end-to-end 충실도를 보장하지 못하는 이유이자
+- 이 ②③ 잔차가 곧 **logit-level 오차의 대부분**(component ablation 56% / 2-edge joint 49.6% 중 cross 10.1% 를
+  뺀 나머지)이고, op-gap≈0 이 end-to-end 충실도를 보장하지 못하는 이유이자
   남은 future work 이다.
 
 ### F. input-IG 의 역할 — closed-form 이 못 닿는 곳
@@ -401,7 +452,7 @@ EAP score 에 가해지는 보정이다 (midpoint/secant = 경로 평균 Jacobia
 
 - op-gap 은 **op 하나의 비선형을 isolate** 한 지표. op 출력이 downstream 비선형을 통과하며 받는 추가 왜곡
   (self-repair)은 **배제**된다. 따라서 **op-gap ≈ 0 이어도 최종 logit-level / single-edge AP fidelity 는 보장 안 됨**
-  (앞 실험에서 모듈이 logit-level 갭은 못 줄였고, top edge 의 ~95% self-repair 오차가 지배).
+  (앞 실험에서 모듈이 logit-level 갭은 못 줄였고, 미보정 self-repair 잔차가 지배 — component 56% / joint 49.6%).
 - 즉 모듈은 "각 op 의 2차항은 정확히 모델링하지만 self-repair 는 못 한다." op-gap=0 은 메커니즘 검증이지
   attribution 충실도 보장이 아니다.
 - op-level full-transition = circuit ablation(CPR) regime 과 가까움 → 모듈의 진짜 효용은 CPR(모델 행동)로 검증.
