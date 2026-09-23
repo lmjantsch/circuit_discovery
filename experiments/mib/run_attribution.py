@@ -7,7 +7,7 @@ Usage:
         --tasks ioi mcqa \\
         --split train \\
         --num-examples 100 \\
-        --output-dir experiments/mib/MIB-circuit-track/circuits
+        --output-dir experiments/mib/circuits
 """
 
 import argparse
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train")
     parser.add_argument("--num-examples", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=None, help="Overrides per-model defaults.")
-    parser.add_argument("--output-dir", default="experiments/mib/MIB-circuit-track/circuits")
+    parser.add_argument("--output-dir", default="experiments/mib/circuits")
     parser.add_argument("--method-name", default="dpa_patching_edge",
                         help="Subdirectory name under output-dir identifying this run's method/config.")
     parser.add_argument("--use-counterfactual", action="store_true")
@@ -119,6 +119,14 @@ def parse_args() -> argparse.Namespace:
         "--norm-approx", dest="norm_approx", default=None,
         choices=[None, "frozen"],
         help="Norm approximation mode: None=original, frozen=detach denominator",
+    )
+    parser.add_argument(
+        "--attn-softcap-fn", default=None,
+        help="Gemma2 attention softcap rule. Defaults to the model's original softcap.",
+    )
+    parser.add_argument(
+        "--center-writing-weights", action="store_true", default=False,
+        help="Center weights that write into the residual stream.",
     )
     parser.add_argument( # TODO: implement
         "--no-softcap", dest="no_sofrcap", action="store_true", default=False,
@@ -183,11 +191,13 @@ def run() -> None:
         "matmul_fn": args.matmul_fn,
         "mul_fn": args.mul_fn,
         "norm_approx": args.norm_approx,
-        "attn_softcap_fn": args.attn_softcap_fn,
-        "center_writing_weights": args.center_writing_weights,
     }
     if args.mlp_act_fn is not None:
         lvp_kwargs["mlp_act_fn"] = args.mlp_act_fn
+    if args.attn_softcap_fn is not None:
+        lvp_kwargs["attn_softcap_fn"] = args.attn_softcap_fn
+    if args.center_writing_weights:
+        lvp_kwargs["center_writing_weights"] = True
 
     logger.info("=" * 60)
     logger.info("DPA Circuit Attribution (EdgeCircuitTracer / LVP)")

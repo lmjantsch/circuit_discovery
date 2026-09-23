@@ -86,7 +86,8 @@ if __name__ == "__main__":
 
         for method in args.methods:
             for task in args.tasks:
-                circuit_path = os.path.join(args.circuit_dir, method, f"{task}_{model_name}", 'scores.pt')
+                # run_attribution writes MIB-style dirs with hyphenated task names
+                circuit_path = os.path.join(args.circuit_dir, method, f"{task.replace('_', '-')}_{model_name}", 'scores.pt')
                 if not os.path.exists(circuit_path):
                     print(f"Circuit not found, skipping: {circuit_path}")
                     continue
