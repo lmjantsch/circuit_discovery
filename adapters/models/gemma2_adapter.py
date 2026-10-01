@@ -10,6 +10,11 @@ from adapters.utils import head_wise_forward
 
 class Gemma2LayerAdapter(Llama2LayerAdapter):
 
+    def residual_out_hook(self, detached: bool = True) -> torch.Tensor:
+        # Current Transformers Gemma2DecoderLayer returns (hidden_states, ...).
+        hidden_state = self.layer.output[0]
+        return hidden_state.detach() if detached else hidden_state
+
     def head_wise_attn_out_hook(self, detached: bool = True) -> torch.Tensor:
         attn_out = self.attention_interface.output[0]
         attn_out = head_wise_forward(self.o_proj, attn_out, self.parent.head_dim)  # (n_heads, B, S, d_model)

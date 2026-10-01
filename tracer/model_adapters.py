@@ -5,6 +5,11 @@ from torch import nn
 
 from tracer.modeling_utils import apply_inverse_rope
 
+
+def _decoder_hidden_state(output):
+    """Return the hidden-state tensor from decoder outputs across HF versions."""
+    return output[0] if isinstance(output, (tuple, list)) else output
+
 class ModelAdapter(ABC):
 
     def __init__(self, model, ignore_norm: bool = False, norm_approx: str | None = None):
@@ -353,13 +358,13 @@ class Llama2ModelAdapter(ModelAdapter):
         return layer.output
 
     def ln_1_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
-        if self.norm_approx == 'dynamic_thr':
+        if self.norm_approx in ('dynamic_thr', 'ig'):
             layer.input_layernorm.source.baseline_hidden_hook_0.output = baseline_tensor
         elif self.norm_approx == 'dynamic_msk':
             layer.input_layernorm.source.baseline_hidden_hook_1.output = mask
 
     def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
-        if self.norm_approx == 'dynamic_thr':
+        if self.norm_approx in ('dynamic_thr', 'ig'):
             layer.post_attention_layernorm.source.baseline_hidden_hook_0.output = baseline_tensor
         elif self.norm_approx == 'dynamic_msk':
             layer.post_attention_layernorm.source.baseline_hidden_hook_1.output = mask
@@ -382,18 +387,18 @@ class Llama2ModelAdapter(ModelAdapter):
         return layer.self_attn.source.attention_interface_0.source.repeat_kv_1.output
     
     def qv_matmul(self, layer: nn.Module) -> tuple:
-        (x, y), _ = layer.self_attn.source.attention_interface_0.source.module_matmul_fn_0.inputs
+        (x, y), _ = layer.self_attn.source.attention_interface_0.source.module_qk_matmul_fn_0.inputs
         return (x.detach(), y.detach())
     
     def qv_context(self, layer: nn.Module, context: dict):
-        layer.self_attn.source.attention_interface_0.source.module_matmul_fn_0.source.fwd_context_hook_0.output = context
+        layer.self_attn.source.attention_interface_0.source.module_qk_matmul_fn_0.source.fwd_context_hook_0.output = context
     
     def av_matmul(self, layer: nn.Module) -> tuple:
-        (x, y), _ =  layer.self_attn.source.attention_interface_0.source.module_matmul_fn_1.inputs
+        (x, y), _ =  layer.self_attn.source.attention_interface_0.source.module_av_matmul_fn_0.inputs
         return (x.detach(), y.detach())
     
     def av_context(self, layer: nn.Module, context: dict):
-        layer.self_attn.source.attention_interface_0.source.module_matmul_fn_1.source.fwd_context_hook_0.output = context
+        layer.self_attn.source.attention_interface_0.source.module_av_matmul_fn_0.source.fwd_context_hook_0.output = context
 
     def attn_softmax_input(self, layer: nn.Module) -> torch.Tensor:
         (x,), _ = layer.self_attn.source.attention_interface_0.source.module_attn_act_fn_0.inputs
@@ -589,12 +594,16 @@ class Llama2ModelAdapter(ModelAdapter):
 
 class Gemma2ModelAdapter(Llama2ModelAdapter):
 
+    # transformers 4.57.x: Gemma2DecoderLayer returns a tuple (hidden_states,) unlike Qwen2
+    def residual_out(self, layer: nn.Module) -> torch.Tensor:
+        return _decoder_hidden_state(layer.output)
+
     # gemma has pre and post module layer norm
     def residual_mid(self, layer: nn.Module) -> torch.Tensor:
         return layer.pre_feedforward_layernorm.input
 
     def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
-        if self.norm_approx == 'dynamic_thr':
+        if self.norm_approx in ('dynamic_thr', 'ig'):
             layer.pre_feedforward_layernorm.source.baseline_hidden_hook_0.output = baseline_tensor
         elif self.norm_approx == 'dynamic_msk':
             layer.pre_feedforward_layernorm.source.baseline_hidden_hook_1.output = mask
@@ -754,16 +763,16 @@ class GPT2ModelAdapter(ModelAdapter):
         return layer.ln_2.input
 
     def residual_out(self, layer: nn.Module) -> torch.Tensor:
-        return layer.output
+        return _decoder_hidden_state(layer.output)
 
     def ln_1_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
-        if self.norm_approx == 'dynamic_thr':
+        if self.norm_approx in ('dynamic_thr', 'ig'):
             layer.ln_1.source.baseline_hidden_hook_0.output = baseline_tensor
         elif self.norm_approx == 'dynamic_msk':
             layer.ln_1.source.baseline_hidden_hook_1.output = mask
 
     def ln_2_baseline_hook(self, layer: nn.Module, baseline_tensor: torch.Tensor, mask: torch.Tensor) -> None:
-        if self.norm_approx == 'dynamic_thr':
+        if self.norm_approx in ('dynamic_thr', 'ig'):
             layer.ln_2.source.baseline_hidden_hook_0.output = baseline_tensor
         elif self.norm_approx == 'dynamic_msk':
             layer.ln_2.source.baseline_hidden_hook_1.output = mask
@@ -786,18 +795,18 @@ class GPT2ModelAdapter(ModelAdapter):
         return layer.attn.source.transpose_3.output
     
     def qv_matmul(self, layer: nn.Module) -> tuple:
-        (x, y), _ = layer.attn.source.attention_interface_0.source.module_matmul_fn_0.inputs
+        (x, y), _ = layer.attn.source.attention_interface_0.source.module_qk_matmul_fn_0.inputs
         return (x.detach(), y.detach())
     
     def qv_context(self, layer: nn.Module, context: dict):
-        layer.attn.source.attention_interface_0.source.module_matmul_fn_0.source.fwd_context_hook_0.output = context
+        layer.attn.source.attention_interface_0.source.module_qk_matmul_fn_0.source.fwd_context_hook_0.output = context
 
     def av_matmul(self, layer: nn.Module) -> tuple:
-        (x, y), _ = layer.attn.source.attention_interface_0.source.module_matmul_fn_1.inputs
+        (x, y), _ = layer.attn.source.attention_interface_0.source.module_av_matmul_fn_0.inputs
         return (x.detach(), y.detach())
     
     def av_context(self, layer: nn.Module, context: dict):
-        layer.attn.source.attention_interface_0.source.module_matmul_fn_1.source.fwd_context_hook_0.output = context
+        layer.attn.source.attention_interface_0.source.module_av_matmul_fn_0.source.fwd_context_hook_0.output = context
 
     def attn_softmax_input(self, layer: nn.Module) -> torch.Tensor:
         (x,), _ = layer.attn.source.attention_interface_0.source.module_attn_act_fn_0.inputs
@@ -974,4 +983,3 @@ class GPT2ModelAdapter(ModelAdapter):
         grad_post_norm = torch.einsum('bhsd, hdD -> bhsD', grad, W_linear)
         grad_pre_norm = self._compute_norm_input_gradient(grad_post_norm, x_pre_norm, x_baseline, mask, norm)
         return grad_pre_norm.transpose(0, 1)
-        

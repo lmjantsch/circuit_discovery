@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 import math
+import os
 
 import torch
 from torch.utils.data import DataLoader
@@ -12,6 +13,23 @@ from .modeling_utils import calculate_theta
 VARIANCE_TYPES = ('within', 'in_between', 'none')
 NORM_MATCHING_TYPES = (None, 'source', 'target')
 COS_THRESHOLD_TYPES = ('none', 'hard', 'linear', 'tanh')
+# Which activations the baseline-aware local rules (midpoint bilinear, secant
+# activation) receive as x_base during integrated-gradient steps.
+#   'counterfactual' - the original behaviour: every pass, including each IG step
+#                      alpha, is anchored at the counterfactual activation, so the
+#                      midpoint is taken between x_alpha and x_cf (effective point
+#                      alpha = 0.7 for Z=5 instead of 0.5).
+#   'next_step'      - each IG step alpha_k is anchored at the activation of step
+#                      alpha_{k+1} (the last one at the counterfactual), so every
+#                      local rule integrates exactly over its own sub-interval.
+# Selected with the IG_ANCHOR environment variable; the default reproduces all
+# earlier results.
+#   'clean_cf'       - the local two-point rules keep the clean and counterfactual
+#                      states at every IG step, so their coefficients do not move
+#                      along the path; IG then only integrates the ops that have
+#                      no exact two-point rule (softmax, normalisation). Needs the
+#                      pair_matmul / pair_mul / secant_pair_* rules.
+IG_ANCHOR_TYPES = ('counterfactual', 'next_step', 'clean_cf')
 
 
 class EdgeCircuitTracer:
@@ -52,11 +70,20 @@ class EdgeCircuitTracer:
         self.source_cache = None   # shape: [source_dims, B, S, d]
         self.baseline_cache = {}
         self.activation_cache = {}
+        self.clean_activation_cache = {}
         self.baseline_source_cache = None
         self.disable_source_caching = False
 
         self.clean_embeds = None
         self.corrupt_embeds = None
+
+        # Which baseline activations to record. None keeps all of them; a set keeps
+        # only the ones the configured rules actually read, which matters for the
+        # next-step anchor on long prompts, where four extra caches are alive at once.
+        self.anchor_keys = None
+
+        self.ig_anchor = os.environ.get('IG_ANCHOR', 'counterfactual')
+        assert self.ig_anchor in IG_ANCHOR_TYPES, f"IG_ANCHOR must be one of {IG_ANCHOR_TYPES}"
 
         self.curr_batch_size = None
         self.curr_seq_len = None
@@ -117,6 +144,22 @@ class EdgeCircuitTracer:
                     self.baseline_source_cache = self.source_cache
                     self.source_cache = self._init_source_cache()
 
+                alphas = torch.linspace(0, 1, integration_steps + 1)[1:-1] if integration_steps > 1 else []
+                step_anchor = None
+                if integration_steps > 1 and self.ig_anchor == 'clean_cf':
+                    cf_acts = self.activation_cache
+                    self.disable_source_caching = True
+                    self.activation_cache = {}
+                    with self.model.trace(**clean_inputs):
+                        self._forward_pass_and_cache(is_baseline=True)
+                    self.clean_activation_cache = self.activation_cache
+                    self.activation_cache = cf_acts
+                    self.disable_source_caching = False
+
+                if integration_steps > 1 and self.ig_anchor == 'next_step':
+                    step_anchor = self._capture_step_anchors(clean_inputs, alphas)
+                    self.activation_cache = step_anchor[0]   # clean pass (alpha=0) -> alpha_1
+
                 with self.model.trace(**clean_inputs):
                     self._forward_pass_and_cache()
                     self.clean_embeds = self.cache['emb'].detach().clone()
@@ -138,7 +181,9 @@ class EdgeCircuitTracer:
 
                 if integration_steps > 1:
                     self.disable_source_caching = True
-                    for alpha in torch.linspace(0, 1, integration_steps + 1)[1:-1]:  # k / integration_steps for k in range(integration_steps)
+                    for k, alpha in enumerate(alphas, start=1):  # k / integration_steps for k in range(integration_steps)
+                        if step_anchor is not None:
+                            self.activation_cache = step_anchor[k]   # alpha_k -> alpha_{k+1}
                         with self.model.trace(**clean_inputs):
                             integrated_embeds = (1 - alpha) * self.clean_embeds + alpha * self.corrupt_embeds
                             self._forward_pass_and_cache(integrated_embeds)
@@ -151,6 +196,43 @@ class EdgeCircuitTracer:
             return (self.circuit_scores, stat)
 
         return (self.circuit_scores, None)
+
+    def _capture_step_anchors(self, clean_inputs, alphas) -> list:
+        """Forward-only passes that record the activations the local rules read
+        as x_base, at alpha_1 ... alpha_{Z-1}; the counterfactual activations
+        (alpha = 1) already in activation_cache close the list.
+
+        Returns anchors where anchors[k] is the x_base for the pass at alpha_k
+        (alpha_0 = clean), i.e. the activations at alpha_{k+1}.
+        Source caching is disabled so the source differences computed from the
+        clean and counterfactual passes are left untouched.
+        """
+        cf_acts = self.activation_cache
+        saved_flag = self.disable_source_caching
+        self.disable_source_caching = True
+
+        with self.model.trace(**clean_inputs):             # clean embeddings only
+            self._forward_pass_and_cache(is_baseline=True)
+            clean_embeds = self.cache['emb'].detach().clone()
+
+        anchors = []
+        for alpha in alphas:
+            self.activation_cache = {}
+            with self.model.trace(**clean_inputs):
+                self._forward_pass_and_cache((1 - alpha) * clean_embeds + alpha * self.corrupt_embeds,
+                                             is_baseline=True)
+                # Park the step's activations on the host: all Z-1 of them are alive at
+                # once, which overflows a 40GB card on long prompts, and only the one
+                # step in use has to be on the device.
+                off = lambda t: t.cpu() if hasattr(t, "cpu") else t
+                self.activation_cache = {k: (tuple(off(t) for t in v) if isinstance(v, tuple) else off(v))
+                                         for k, v in self.activation_cache.items()}
+            anchors.append(self.activation_cache)
+        anchors.append(cf_acts)
+
+        self.activation_cache = cf_acts
+        self.disable_source_caching = saved_flag
+        return anchors
 
     @contextmanager
     def manage_batch_context(self):
@@ -168,8 +250,33 @@ class EdgeCircuitTracer:
         self.cache = {}
         self.baseline_cache = {}
         self.activation_cache = {}
+        self.clean_activation_cache = {}
         self.source_cache = None
         self.baseline_source_cache = None
+
+    def _keep(self, key: str) -> bool:
+        return self.anchor_keys is None or key in self.anchor_keys
+
+    def _base(self, key: str, layer_id: int, pair: bool = False) -> dict:
+        """The x_base/y_base entries for one rule, empty when that activation was
+        not recorded because no active rule reads it."""
+        c = self.activation_cache.get(f"{layer_id}.{key}")
+        if c is None:
+            return {}
+        dev = self.adapter.device
+        to = lambda t: t.to(dev) if hasattr(t, "to") and getattr(t, "device", dev) != dev else t
+        return {"x_base": to(c[0]), "y_base": to(c[1])} if pair else {"x_base": to(c)}
+
+    def _with_clean(self, ctx: dict, key: str, layer_id: int, pair: bool = False) -> dict:
+        """Add the clean-state entries the fixed-endpoint rules read.
+
+        Empty unless IG_ANCHOR='clean_cf', so every other mode is untouched.
+        """
+        c = self.clean_activation_cache.get(f"{layer_id}.{key}")
+        if c is None:
+            return ctx
+        ctx.update({"x_clean": c[0], "y_clean": c[1]} if pair else {"x_clean": c})
+        return ctx
 
     def _forward_pass_and_cache(self, integrated_embeds: torch.Tensor | None = None, is_baseline: bool = False):
         B, S, d = self.curr_batch_size, self.curr_seq_len, self.adapter.model_dim  # (B, S, d)
@@ -199,14 +306,17 @@ class EdgeCircuitTracer:
             self.cache[f'{layer_id}.value_out'] = self.adapter.value_out(layer)
 
             if is_baseline:
-                self.activation_cache[f"{layer_id}.qv_matmul"] = self.adapter.qv_matmul(layer)
-                self.activation_cache[f"{layer_id}.attn_act"] = self.adapter.attn_softmax_input(layer)
-                self.activation_cache[f"{layer_id}.av_matmul"] = self.adapter.av_matmul(layer)
+                if self._keep("qv_matmul"):
+                    self.activation_cache[f"{layer_id}.qv_matmul"] = self.adapter.qv_matmul(layer)
+                if self._keep("attn_act"):
+                    self.activation_cache[f"{layer_id}.attn_act"] = self.adapter.attn_softmax_input(layer)
+                if self._keep("av_matmul"):
+                    self.activation_cache[f"{layer_id}.av_matmul"] = self.adapter.av_matmul(layer)
             else:
                 theta = calculate_theta(self.cache[f"{layer_id - 1}.out"], self.baseline_cache[f"{layer_id - 1}.out"])
-                self.adapter.qv_context(layer, {"x_base": self.activation_cache[f"{layer_id}.qv_matmul"][0], "y_base": self.activation_cache[f"{layer_id}.qv_matmul"][1], "x_theta": theta.unsqueeze(1), "y_theta": theta.unsqueeze(1).transpose(-2, -1)})
-                self.adapter.attn_softmax_context(layer, {"x_base": self.activation_cache[f"{layer_id}.attn_act"], "theta": theta.unsqueeze(1)})
-                self.adapter.av_context(layer, {"x_base": self.activation_cache[f"{layer_id}.av_matmul"][0], "y_base": self.activation_cache[f"{layer_id}.av_matmul"][1], "y_theta": theta.unsqueeze(1), "is_av_matmul": True})
+                self.adapter.qv_context(layer, self._with_clean({**self._base("qv_matmul", layer_id, pair=True), "x_theta": theta.unsqueeze(1), "y_theta": theta.unsqueeze(1).transpose(-2, -1)}, 'qv_matmul', layer_id, pair=True))
+                self.adapter.attn_softmax_context(layer, self._with_clean({**self._base("attn_act", layer_id), "theta": theta.unsqueeze(1)}, 'attn_act', layer_id, pair=False))
+                self.adapter.av_context(layer, self._with_clean({**self._base("av_matmul", layer_id, pair=True), "y_theta": theta.unsqueeze(1), "is_av_matmul": True}, 'av_matmul', layer_id, pair=True))
 
             self._update_source_cache(
                 self.adapter.per_head_attn_out(layer).detach().reshape(self.adapter.n_heads, B, S, d),
@@ -222,12 +332,14 @@ class EdgeCircuitTracer:
             self.cache[f'{layer_id}.up_out'] = self.adapter.up_out(layer)
 
             if is_baseline:
-                self.activation_cache[f"{layer_id}.mlp_act"] = self.adapter.gate_act_input(layer)
-                self.activation_cache[f"{layer_id}.gu_mul"] = self.adapter.gu_mul(layer)
+                if self._keep("mlp_act"):
+                    self.activation_cache[f"{layer_id}.mlp_act"] = self.adapter.gate_act_input(layer)
+                if self._keep("gu_mul"):
+                    self.activation_cache[f"{layer_id}.gu_mul"] = self.adapter.gu_mul(layer)
             else:
                 theta = calculate_theta(self.cache[f"{layer_id}.mid"], self.baseline_cache[f"{layer_id}.mid"])
-                self.adapter.gate_act_context(layer, {"x_base": self.activation_cache[f"{layer_id}.mlp_act"], "theta": theta})
-                self.adapter.gu_context(layer, {"x_base": self.activation_cache[f"{layer_id}.gu_mul"][0], "y_base": self.activation_cache[f"{layer_id}.gu_mul"][1], "theta": theta})
+                self.adapter.gate_act_context(layer, self._with_clean({**self._base("mlp_act", layer_id), "theta": theta}, 'mlp_act', layer_id, pair=False))
+                self.adapter.gu_context(layer, self._with_clean({**self._base("gu_mul", layer_id, pair=True), "theta": theta}, 'gu_mul', layer_id, pair=True))
 
             self._update_source_cache(
                 self.adapter.mlp_out(layer).detach().reshape(1, B, S, d), type='mlp', layer_id=layer_id)
