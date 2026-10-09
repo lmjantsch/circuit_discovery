@@ -45,7 +45,7 @@ PERCENTAGES = (.001, .002, .005, .01, .02, .05, .1, .2, .5, 1)
 
 class EdgeCircuitPatcher:
 
-    def __init__(self, adapter: ModelAdapter, tokenizer: AutoTokenizer, cache_device: torch.device | None = None, norm_matching: bool = False):
+    def __init__(self, adapter: ModelAdapter, tokenizer: AutoTokenizer, cache_device: torch.device | None = None, norm_matching: bool = False, necessity: bool = False, distribution_metrics: bool = False, percentages: tuple[float, ...] | None = None):
         self.adapter = adapter
         self.model = adapter.model
         self.tokenizer = tokenizer
@@ -55,8 +55,25 @@ class EdgeCircuitPatcher:
             self.cache_device = adapter.device
 
         self.norm_matching = norm_matching
+        # necessity=False -> sufficiency (corrupt the NON-circuit, keep circuit clean; = CPR).
+        # necessity=True  -> ablate the CIRCUIT itself (corrupt circuit, keep rest clean).
+        self.necessity = necessity
+        # distribution_metrics=True additionally records, per percentage, the full
+        # next-token distribution of the patched run vs. the clean run, giving
+        # Circuit Error (argmax mismatch rate) and KL(clean || circuit).
+        # See arXiv:2510.00845 Sec. 3.4.
+        self.distribution_metrics = distribution_metrics
+        # Circuit sizes to evaluate, as a fraction of the valid edges. Overriding this
+        # lets a run add a single new point (e.g. 0.0005) without recomputing the rest;
+        # 1.0 stays appended because both endpoints are filled in closed form.
+        self.percentages = tuple(percentages) if percentages is not None else PERCENTAGES
+        if self.percentages[-1] != 1.0:
+            self.percentages = self.percentages + (1.0,)
 
         self.faithfulness_agg = None
+        self.ce_agg = None
+        self.kl_agg = None
+        self.last_distribution_metrics = None
 
         self._empty_cache()
 
@@ -77,6 +94,9 @@ class EdgeCircuitPatcher:
         self._c_clean_logit_diff = None
         self._c_base_logit_diff = None
 
+        self._c_last_token_idx = None
+        self._c_clean_logits = None
+
     def _init_source_cache(self) -> torch.Tensor:
         return torch.zeros(
             self.adapter.source_dims, self._c_batch_size, self._c_seq_length, self.adapter.model_dim,
@@ -85,7 +105,10 @@ class EdgeCircuitPatcher:
 
     @contextmanager
     def circuit_context(self, circuit_scores: torch.Tensor):
-        self.faithfulness_agg = [[] for _ in PERCENTAGES]
+        self.faithfulness_agg = [[] for _ in self.percentages]
+        if self.distribution_metrics:
+            self.ce_agg = [[] for _ in self.percentages]
+            self.kl_agg = [[] for _ in self.percentages]
         self.valid_edge_mask = self.get_valid_edge_mask()
         self.n_edges = self.valid_edge_mask.sum()
         self.forward_to_backward = self.get_forward_to_backward()
@@ -100,6 +123,8 @@ class EdgeCircuitPatcher:
             raise(e)
         finally:
             self.faithfulness_agg = None
+            self.ce_agg = None
+            self.kl_agg = None
             self.valid_edge_mask = None
             self.n_edges = None
             self.forward_to_backward = None
@@ -123,6 +148,7 @@ class EdgeCircuitPatcher:
             last_token_idx = self._c_inputs['attention_mask'].sum(dim=-1) - 1
         self._c_target_idx = (range(B), last_token_idx, target)
         self._c_base_target_idx = (range(B), last_token_idx, base_target)
+        self._c_last_token_idx = (range(B), last_token_idx)
 
         try:
             yield
@@ -131,7 +157,7 @@ class EdgeCircuitPatcher:
 
 
     def patch_circuit(self, dataloader: DataLoader, circuit_scores, return_residual_stats: bool = False):
-        self._residual_stats_agg = [[] for _ in PERCENTAGES[:-1]] if return_residual_stats else None
+        self._residual_stats_agg = [[] for _ in self.percentages[:-1]] if return_residual_stats else None
         with self.circuit_context(circuit_scores):
             for batch in tqdm(dataloader):
                 self._process_batch(batch)
@@ -144,14 +170,21 @@ class EdgeCircuitPatcher:
                 finite = [x for x in s if x == x and x not in (float('inf'), float('-inf'))]
                 return (sum(finite) / len(finite)) if finite else float('nan')
             faithfulness = [_finite_mean(s) for s in self.faithfulness_agg]
-            weighted_edge_counts = [int(self.n_edges * p) for p in PERCENTAGES]
-            result = (faithfulness, PERCENTAGES, weighted_edge_counts)
+            weighted_edge_counts = [int(self.n_edges * p) for p in self.percentages]
+            result = (faithfulness, self.percentages, weighted_edge_counts)
+
+            if self.distribution_metrics:
+                self.last_distribution_metrics = {
+                    "circuit_error": [_finite_mean(s) for s in self.ce_agg],
+                    "kl_divergence": [_finite_mean(s) for s in self.kl_agg],
+                    "n_samples": [len(s) for s in self.ce_agg],
+                }
 
             if return_residual_stats:
                 stats = {
                     p: (torch.cat([t[0] for t in tensors], dim=1),
                         torch.cat([t[1] for t in tensors], dim=1))
-                    for p, tensors in zip(PERCENTAGES[:-1], self._residual_stats_agg)
+                    for p, tensors in zip(self.percentages[:-1], self._residual_stats_agg)
                 }
                 self._residual_stats_agg = None
                 return result, stats
@@ -203,20 +236,47 @@ class EdgeCircuitPatcher:
             with self.model.trace(**self._c_inputs):
                 self._cache_clean()
 
-            for p_id, percentage in enumerate(PERCENTAGES[:-1]): # exlude 1.0
+            for p_id, percentage in enumerate(self.percentages[:-1]): # exlude 1.0
                 in_graph = self._get_in_graph(percentage)
                 in_graph = in_graph
                 with self.model.trace(**self._c_inputs):
-                    patched_diff = self._cache_patched(in_graph)
+                    patched_diff, patched_logits = self._cache_patched(in_graph)
 
                 batch_score = (patched_diff - self._c_base_logit_diff) / (self._c_clean_logit_diff - self._c_base_logit_diff)
                 self.faithfulness_agg[p_id].extend(batch_score.tolist())
 
+                if self.distribution_metrics:
+                    ce, kl = self._distribution_metrics(patched_logits)
+                    self.ce_agg[p_id].extend(ce)
+                    self.kl_agg[p_id].extend(kl)
+
                 if self._residual_stats_agg is not None:
                     self._residual_stats_agg[p_id].append(self._collect_residual_stats())
 
-            # set 1.0 for all 100% circuits
-            self.faithfulness_agg[-1].extend([1 for _ in range(self._c_batch_size)])
+            # 100% circuit endpoint: sufficiency keeps everything (=clean => 1);
+            # necessity ablates everything (=corrupt => 0).
+            endpoint = 0.0 if self.necessity else 1.0
+            self.faithfulness_agg[-1].extend([endpoint for _ in range(self._c_batch_size)])
+            if self.distribution_metrics:
+                # At 100% the sufficiency circuit *is* the full model: identical logits.
+                # Under necessity the whole graph is ablated, so no cheap closed form
+                # exists and the endpoint is left as NaN.
+                fill = 0.0 if not self.necessity else float('nan')
+                self.ce_agg[-1].extend([fill for _ in range(self._c_batch_size)])
+                self.kl_agg[-1].extend([fill for _ in range(self._c_batch_size)])
+
+    def _distribution_metrics(self, patched_logits: torch.Tensor) -> tuple[list[float], list[float]]:
+        """Per-sample Circuit Error indicator and KL(clean || circuit) at the answer position."""
+        clean = self._c_clean_logits.float()
+        patched = patched_logits.float()
+
+        ce = (patched.argmax(dim=-1) != clean.argmax(dim=-1)).float()
+
+        log_p = torch.log_softmax(clean, dim=-1)
+        log_q = torch.log_softmax(patched, dim=-1)
+        kl = (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+
+        return ce.tolist(), kl.tolist()
 
     def _update_source_cache(self, new_tensor: torch.Tensor, source_cache: torch.Tensor, type: str, layer_id: int = None):
         source_slice = self.adapter.get_src_slice(type=type, layer_id=layer_id)
@@ -246,12 +306,18 @@ class EdgeCircuitPatcher:
         
         self._c_base_logit_diff = self._get_logit_diff(self.model.output['logits'])
 
+    def _get_last_token_logits(self, circuit_logits: torch.Tensor):
+        """Next-token logits at the answer position, shape (B, vocab)."""
+        return circuit_logits[self._c_last_token_idx]
+
     def _cache_clean(self):
         for layer_id, layer in enumerate(self.adapter.wrapped_layers):
             self._c_clean_cache[f"{layer_id}.in"] = layer.residual_in_hook()
             self._c_clean_cache[f"{layer_id}.mid"] = layer.residual_mid_hook()
             self._c_clean_cache[f"{layer_id}.out"] = layer.residual_out_hook()
         self._c_clean_logit_diff = self._get_logit_diff(self.model.output['logits'])
+        if self.distribution_metrics:
+            self._c_clean_logits = self._get_last_token_logits(self.model.output['logits'])
 
     def _cache_patched(self, in_graph: torch.Tensor):
         B, S, d = self._c_batch_size, self._c_seq_length, self.adapter.model_dim
@@ -294,8 +360,11 @@ class EdgeCircuitPatcher:
         self.adapter.logit_patch_hook(
             out_state + self._compute_patched_residual(in_graph, 'lm_head', None)[0], post_scaling= self.norm_matching
         )
-        
-        return self._get_logit_diff(self.model.output['logits'])
+
+        logits = self.model.output['logits']
+        if self.distribution_metrics:
+            return self._get_logit_diff(logits), self._get_last_token_logits(logits)
+        return self._get_logit_diff(logits), None
 
     def get_valid_edge_mask(self):
         mask = torch.zeros(self.adapter.source_dims, self.adapter.grad_dims).bool()
@@ -353,8 +422,12 @@ class EdgeCircuitPatcher:
 
         in_graph = self._prune(in_graph)
 
-        # Flip boolean for all valid edges
-        in_graph = ~in_graph
+        # `in_graph` here is the pruned circuit (top-k). The correction (corrupt−clean) is
+        # applied to edges that are True in the returned mask.
+        #   sufficiency: apply corrupt to NON-circuit  -> flip (keep circuit clean)
+        #   necessity:   apply corrupt to the CIRCUIT  -> no flip (ablate the circuit)
+        if not self.necessity:
+            in_graph = ~in_graph
         in_graph[~self.valid_edge_mask] = False
 
         return in_graph.to(device=self.adapter.device)

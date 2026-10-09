@@ -14,14 +14,7 @@ import argparse
 import json
 import logging
 import os
-from pathlib import Path
-import sys
 import time
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_LOCAL_LINEAR_TRANSFORMER = _REPO_ROOT / "vendor" / "linear_transformer"
-if str(_LOCAL_LINEAR_TRANSFORMER) not in sys.path:
-    sys.path.insert(0, str(_LOCAL_LINEAR_TRANSFORMER))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -89,9 +82,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split", default="train")
     parser.add_argument("--num-examples", type=int, default=100)
-    parser.add_argument("--example-offset", type=int, default=0,
-                        help="Skip this many (post-filter) examples before taking --num-examples. "
-                             "Used to build disjoint train slices for stability experiments.")
     parser.add_argument("--batch-size", type=int, default=None, help="Overrides per-model defaults.")
     parser.add_argument("--output-dir", default="experiments/mib/MIB-circuit-track/circuits")
     parser.add_argument("--method-name", default="dpa_patching_edge",
@@ -107,15 +97,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--matmul-fn", default="matmul",
-        help="Shared QK/AV matmul rule. Used as the fallback for site-specific rules.",
-    )
-    parser.add_argument(
-        "--qk-matmul-fn", default=None,
-        help="Optional QK-only matmul rule. Overrides --matmul-fn at the attention-score product.",
-    )
-    parser.add_argument(
-        "--av-matmul-fn", default=None,
-        help="Optional AV-only matmul rule. Overrides --matmul-fn at attention value aggregation.",
+        help="QK and AV matmul rule (Rule 4). Key into BILINEAR_FN.",
     )
     parser.add_argument(
         "--mul-fn", default="mul",
@@ -127,18 +109,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--norm-approx", dest="norm_approx", default=None,
-        choices=[None, "frozen", "dynamic_thr", "dynamic_msk", "ig"],
-        help="Norm approximation mode: None=original, frozen=detach denominator, dynamic_thr=threshold-based, dynamic_msk=input-ID mask, ig=baseline sigma.",
-    )
-    parser.add_argument(
-        "--grad-norm-approx", dest="grad_norm_approx", default=None,
-        choices=[None, "frozen", "dynamic_thr", "dynamic_msk", "ig"],
-        help="Overrides --norm-approx for the LVP wrapper only.",
-    )
-    parser.add_argument(
-        "--score-norm-approx", dest="score_norm_approx", default=None,
-        choices=[None, "frozen", "dynamic_thr", "dynamic_msk", "ig"],
-        help="Overrides --norm-approx for the model adapter only.",
+        choices=[None, "frozen", "dynamic_thr", "dynamic_msk"],
+        help="Norm approximation mode: None=original, frozen=detach denominator, dynamic_thr=threshold-based, dynamic_msk=input-ID mask.",
     )
     parser.add_argument(
         "--ignore-norm", dest="ignore_norm", action="store_true", default=False,
@@ -159,7 +131,7 @@ def parse_args() -> argparse.Namespace:
         help='Provide exactly 5 float values (q_weight, k_weight, v_weight, gate_weight, up_weight)'
     )
     parser.add_argument(
-        '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post', 'score'], default='post'
+        '--scale-loc', dest='scale_loc', type=str, choices=['pre', 'post'], default='post'
     )
     parser.add_argument(
         '--norm-matching', dest='norm_matching', default=None,
@@ -177,47 +149,9 @@ def parse_args() -> argparse.Namespace:
         help="Cosine-similarity noise floor thresholding applied to edge scores.",
     )
     parser.add_argument(
-        "--abs", dest="abs_scores", action="store_true", default=False,
-        help="Aggregate |score| instead of score; saves scores_abs.pt and variance_*_abs.pt.",
-    )
-    parser.add_argument(
         "--force", dest="force", action="store_true", default=False,
     )
-    parser.add_argument(
-        "--no-softcap", dest="no_softcap", action="store_true", default=False,
-        help="Disable softcapping: sets model.config.attn_logit_softcapping and final_logit_softcapping to None.",
-    )
     return parser.parse_args()
-
-
-# Which baseline activations each rule reads. Anything not listed here ignores
-# the baseline, so recording it would only cost memory: under the next-step IG
-# anchor four extra caches are alive at once, which overflows a 40GB card on
-# long prompts (Llama-3.1 on ARC).
-_BASELINE_USING_FNS = {
-    "ig_matmul", "ig_mul", "pair_matmul", "pair_mul", "slerp_matmul", "slerp_mul",
-    "bilinear_matmul", "bilinear_mul", "secant_cf_silu", "secant_cf_gelu_tanh",
-    "secant_pair_silu", "secant_pair_gelu_tanh", "lerp_silu", "lerp_gelu_tanh",
-    "slerp_silu", "lerp_softmax", "integrated_softmax", "sec_jac_softmax",
-}
-
-
-def _anchor_keys(lvp_kwargs: dict) -> set[str]:
-    """The activation caches worth recording for this configuration."""
-    uses = lambda v: v in _BASELINE_USING_FNS
-    matmul = lvp_kwargs.get("matmul_fn", "matmul")
-    keys = set()
-    if uses(lvp_kwargs.get("qk_matmul_fn", matmul)):
-        keys.add("qv_matmul")
-    if uses(lvp_kwargs.get("av_matmul_fn", matmul)):
-        keys.add("av_matmul")
-    if uses(lvp_kwargs.get("attn_act_fn", "softmax")):
-        keys.add("attn_act")
-    if uses(lvp_kwargs.get("mul_fn", "mul")):
-        keys.add("gu_mul")
-    if uses(lvp_kwargs.get("mlp_act_fn", "")):
-        keys.add("mlp_act")
-    return keys
 
 
 def _load_model_components(
@@ -242,13 +176,9 @@ def _load_model_components(
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, attn_implementation="eager", device_map="auto",
     ).eval()
-    if args.no_softcap:
-        model.config.attn_logit_softcapping = None
-        model.config.final_logit_softcapping = None
     model = patch_model_for_lvp(model, **lvp_kwargs)
 
-    score_norm = args.score_norm_approx if args.score_norm_approx is not None else args.norm_approx
-    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=score_norm)
+    adapter = adapter_cls(model, ignore_norm=args.ignore_norm, norm_approx=args.norm_approx)
     tracer = EdgeCircuitTracer(
         adapter, tokenizer,
         variance_type=args.variance_type,
@@ -257,10 +187,7 @@ def _load_model_components(
         gate_weight=args.weights[3], up_weight=args.weights[4],
         scale_loc=args.scale_loc,
         cos_threshold=args.cos_threshold,
-        abs_scores=args.abs_scores,
     )
-    tracer.anchor_keys = _anchor_keys(lvp_kwargs)
-
     return tokenizer, adapter, tracer
 
 
@@ -271,14 +198,10 @@ def run() -> None:
         "attn_act_fn": args.attn_act_fn,
         "matmul_fn": args.matmul_fn,
         "mul_fn": args.mul_fn,
-        "norm_approx": args.grad_norm_approx if args.grad_norm_approx is not None else args.norm_approx,
+        "norm_approx": args.norm_approx,
         "attn_softcap_fn": args.attn_softcap_fn,
         "center_writing_weights": args.center_writing_weights,
     }
-    if args.qk_matmul_fn is not None:
-        lvp_kwargs["qk_matmul_fn"] = args.qk_matmul_fn
-    if args.av_matmul_fn is not None:
-        lvp_kwargs["av_matmul_fn"] = args.av_matmul_fn
     if args.mlp_act_fn is not None:
         lvp_kwargs["mlp_act_fn"] = args.mlp_act_fn
 
@@ -320,21 +243,19 @@ def run() -> None:
         logger.info("[%s] bs=%d", tag, batch_size)
 
         t0 = time.time()
-        dataset = MIBDataset(task, tokenizer, model_name, split=args.split,
-                             num_examples=args.num_examples, example_offset=args.example_offset)
+        dataset = MIBDataset(task, tokenizer, model_name, split=args.split, num_examples=args.num_examples)
         dataloader = dataset.dataloader(batch_size)
         logger.info("  %d examples, %d batches", len(dataset), len(dataloader))
 
         (scores, variance) = tracer.build_circuit(dataloader, use_counterfactual=args.use_counterfactual, integration_steps=args.integration_steps)
         circuit = create_mib_circuit(scores, adapter.n_layers, adapter.n_heads, adapter.model_dim)
 
-        abs_suffix = "_abs" if args.abs_scores else ""
         os.makedirs(circuit_dir, exist_ok=True)
         with open(os.path.join(circuit_dir, 'importances.json'), "w") as f:
             json.dump(circuit, f, indent=2)
-        torch.save(scores, os.path.join(circuit_dir, f'scores{abs_suffix}.pt'))
+        torch.save(scores, os.path.join(circuit_dir, 'scores.pt'))
         if variance != None:
-            torch.save(variance, os.path.join(circuit_dir, f'variance_{args.variance_type}{abs_suffix}.pt'))
+            torch.save(variance, os.path.join(circuit_dir, f'variance_{args.variance_type}.pt'))
          
         logger.info("  Done in %.1fs — saved %s", time.time() - t0, circuit_dir)
 

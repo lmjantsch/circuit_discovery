@@ -3,6 +3,12 @@ import sys
 import math
 import pickle
 import argparse
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_LOCAL_MODULAR_TRANSFORMER = _REPO_ROOT / "vendor" / "modular_transformer" / "src"
+if str(_LOCAL_MODULAR_TRANSFORMER) not in sys.path:
+    sys.path.insert(0, str(_LOCAL_MODULAR_TRANSFORMER))
 
 proj_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 if proj_path not in sys.path:
@@ -58,7 +64,18 @@ if __name__ == "__main__":
                         help="Subdirectory names under circuit-dir (e.g. eap_bilin_frnorm)")
     parser.add_argument("--split",        type=str, choices=['train', 'validation', 'test'], default='validation')
     parser.add_argument("--absolute",      action="store_true")
+    parser.add_argument(
+        "--rank-absolute", action="store_true",
+        help="Rank by abs(scores.pt). Unlike --absolute, this does not require scores_abs.pt.",
+    )
     parser.add_argument("--norm-matching", action="store_true")
+    parser.add_argument(
+        "--distribution-metrics", action="store_true",
+        help="Also record Circuit Error (argmax mismatch vs full model) and KL(clean || circuit) "
+             "per percentage, following arXiv:2510.00845 Sec. 3.4.",
+    )
+    parser.add_argument("--split-suffix", type=str, default=None,
+                        help="Extra tag appended to the output filename, e.g. a train-slice id.")
     parser.add_argument("--batch-size",   type=int, default=16)
     parser.add_argument("--head",         type=int, default=None,
                         help="Limit dataset to this many examples (default: all)")
@@ -83,19 +100,27 @@ if __name__ == "__main__":
         model = patch_model_for_lvp(model, norm_approx='frozen')
 
         adapter = MIB_MODEL_TO_ADAPTER_CLS[model_name](model, MIB_MODEL_TO_ARC[model_name], frozen_norm=False)
-        patcher = EdgeCircuitPatcher(adapter, tokenizer, norm_matching=args.norm_matching)
+        patcher = EdgeCircuitPatcher(
+            adapter, tokenizer, norm_matching=args.norm_matching,
+            distribution_metrics=args.distribution_metrics,
+        )
 
         for method in args.methods:
             for task in args.tasks:
                 scores_file = 'scores_abs.pt' if args.absolute else 'scores.pt'
-                circuit_path = os.path.join(args.circuit_dir, method, f"{task}_{model_name}", scores_file)
-                if not os.path.exists(circuit_path):
-                    print(f"Circuit not found, skipping: {circuit_path}")
+                # run_attribution writes dirs as `{task.replace('_','-')}_{model}`; accept both spellings.
+                candidates = [
+                    os.path.join(args.circuit_dir, method, f"{tag}_{model_name}", scores_file)
+                    for tag in dict.fromkeys([task, task.replace('_', '-')])
+                ]
+                circuit_path = next((p for p in candidates if os.path.exists(p)), None)
+                if circuit_path is None:
+                    print(f"Circuit not found, skipping: {candidates[0]}")
                     continue
 
                 print(f"[{method}/{model_name}/{task}] Loading circuit from {circuit_path}")
                 circuit_scores = torch.load(circuit_path, map_location='cpu')
-                if args.absolute:
+                if args.absolute or args.rank_absolute:
                     circuit_scores.abs_()
 
                 dataset = MIBDataset(task, tokenizer, model_name, split=args.split, num_examples=args.head)
@@ -106,11 +131,15 @@ if __name__ == "__main__":
                 faithfulnesses, percentages, weighted_edge_counts = patcher.patch_circuit(dataloader, circuit_scores)
                 d = compute_metrics(faithfulnesses, percentages)
                 d["weighted_edge_counts"] = weighted_edge_counts
+                if args.distribution_metrics:
+                    d.update(patcher.last_distribution_metrics)
 
                 nm_prefix = "nm_" if args.norm_matching else ""
                 output_dir = os.path.join(args.output_dir, f"{nm_prefix}{method}")
                 os.makedirs(output_dir, exist_ok=True)
-                out_file = os.path.join(output_dir, f"{task}_{model_name}_{args.split}_abs-{args.absolute}.pkl")
+                rank_absolute = args.absolute or args.rank_absolute
+                suffix = f"_{args.split_suffix}" if args.split_suffix else ""
+                out_file = os.path.join(output_dir, f"{task}_{model_name}_{args.split}_abs-{rank_absolute}{suffix}.pkl")
                 with open(out_file, 'wb') as f:
                     pickle.dump(d, f)
 

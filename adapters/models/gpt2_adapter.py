@@ -10,6 +10,11 @@ from adapters.utils import head_wise_backwards, head_wise_forward_qkv
 
 class GPT2LayerAdapter(LayerAdapter):
 
+    def residual_out_hook(self, detached: bool = True) -> torch.Tensor:
+        # Current Transformers GPT2Block returns (hidden_states, ...).
+        hidden_state = self.layer.output[0]
+        return hidden_state.detach() if detached else hidden_state
+
     def cache_attn_for_grad(self, cache: dict):
         cache[f"{self.layer_id}.q_out_4grad"] = self.q_proj.output
         cache[f"{self.layer_id}.k_out_4grad"] = self.k_proj.output

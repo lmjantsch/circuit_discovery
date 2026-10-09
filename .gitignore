@@ -5,8 +5,22 @@ circuits/
 __pycache__/
 plots/
 scripts/
+grid_search/
+frozen_grid_search/
+grid_search_dryrun/
+
+# Re-cloned MIB-circuit-track (formerly a submodule, now a regular checkout)
+experiments/mib/MIB-circuit-track/
 
 
 # Files
 .log
 test.ipynb
+.codex
+.omx
+experiments/mib/method_comparison
+experiments/mib/data_exploration_jaccard
+experiments/mib/component_ap
+experiments/mib/cv_analysis
+experiments/mib/results_new_patcher
+experiments/mib/circuits_new_patcher

@@ -15,10 +15,11 @@ TASKS_TO_HF_NAMES = {
 class MIBDataset(Dataset):
     """Minimal MIB dataset loader."""
 
-    def __init__(self, task, tokenizer, model_name, split='train', num_examples=100):
+    def __init__(self, task, tokenizer, model_name, split='train', num_examples=100, example_offset=0):
         self.task = task
         self.tokenizer = tokenizer
         self.model_name = model_name
+        self.example_offset = example_offset
 
         hf_url = f"mib-bench/{TASKS_TO_HF_NAMES[task]}"
         if task == 'mcqa':
@@ -34,8 +35,16 @@ class MIBDataset(Dataset):
             self.dataset = load_dataset(hf_url, split=split)
 
         self.dataset = self._filter()
-        if num_examples and num_examples < len(self.dataset):
-            self.dataset = self.dataset.select(range(num_examples))
+        # The offset is applied *after* filtering so that consecutive slices are
+        # disjoint and each has exactly `num_examples` rows.
+        start = example_offset
+        if start >= len(self.dataset):
+            raise ValueError(
+                f"example_offset={start} exceeds filtered dataset size {len(self.dataset)} for {task}/{split}"
+            )
+        stop = len(self.dataset) if not num_examples else min(start + num_examples, len(self.dataset))
+        if (start, stop) != (0, len(self.dataset)):
+            self.dataset = self.dataset.select(range(start, stop))
 
     def _filter(self):
         tok = self.tokenizer
