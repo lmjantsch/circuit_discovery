@@ -377,6 +377,33 @@ softmax IG Z=2 residual, min–max over models:
 
 ---
 
+## 2c. MIB 12 cell 통합 표 — 세 모듈 기준
+
+<!-- LAG-MIB-START -->
+### T9. MIB 12 cell — EAP LAG → 모듈 LAG (모듈 = Bilinear · SM(sm_fix) · FrLN, softmax 는 IG Z=5)
+
+각 칸 = `EAP 1차 LAG → 모듈 적용 후 LAG`. SM 은 clean↔cf chord(sm_fix, huisu `secant_cf_*`) 기준이며 출하판(원점 chord)은 `lag_smfix_report.md` 참조. Q@K 는 row-centered.
+
+| cell | Q@K-c → Bilinear | A@V → Bilinear | gate·up → Bilinear | MLP act → SM | norm → FrLN | softmax → IG(Z=5) |
+|---|---|---|---|---|---|---|
+| gpt2/ioi | 0.84 → 1e-06 | 0.27 → 2e-07 | — | 0.72 → 1e-09 | 0.25 → 0.66 | 1.46 → 0.01 |
+| qwen2.5/ioi | 0.57 → 6e-06 | 0.24 → 2e-07 | 0.48 → 1e-07 | 0.42 → 6e-10 | 0.31 → 0.14 | 1.46 → 0.02 |
+| gemma2/ioi | 0.94 → 2e-06 | 0.15 → 2e-07 | 0.68 → 1e-07 | 0.59 → 7e-15 | 0.31 → 0.11 | 1.12 → 0.01 |
+| llama3/ioi | 0.83 → 2e-06 | 0.27 → 2e-07 | 0.43 → 1e-07 | 0.29 → 6e-15 | 0.26 → 0.09 | 1.17 → 0.01 |
+| qwen2.5/mcqa | 0.63 → 1e-05 | 0.46 → 2e-07 | 0.56 → 8e-08 | 0.51 → 2e-10 | 0.42 → 0.25 | 0.53 → 0.00 |
+| gemma2/mcqa | 0.64 → 2e-06 | 0.43 → 2e-07 | 0.65 → 8e-08 | 0.52 → 2e-15 | 0.32 → 0.25 | 0.54 → 0.01 |
+| llama3/mcqa | 0.41 → 1e-06 | 0.56 → 1e-07 | 0.54 → 7e-08 | 0.36 → 1e-15 | 0.42 → 0.17 | 0.63 → 0.00 |
+| gemma2/arcE | 0.47 → 3e-06 | 0.43 → 4e-07 | 0.62 → 9e-08 | 0.52 → 4e-15 | 0.29 → 0.21 | 0.52 → 0.01 |
+| llama3/arcE | 0.30 → 2e-06 | 0.51 → 3e-07 | 0.52 → 9e-08 | 0.33 → 5e-15 | 0.38 → 0.19 | 0.57 → 0.00 |
+| llama3/arcC | 0.28 → 2e-06 | 0.50 → 3e-07 | 0.52 → 1e-07 | 0.33 → 7e-15 | 0.38 → 0.19 | 0.57 → 0.00 |
+| llama3/arith+ | 0.63 → 1e-06 | 0.54 → 2e-07 | 0.59 → 1e-07 | 0.32 → 0e+00 | 0.29 → 0.10 | 0.51 → 0.00 |
+| llama3/arith− | 0.66 → 1e-06 | 0.50 → 2e-07 | 0.52 → 1e-07 | 0.31 → 0e+00 | 0.26 → 0.11 | 0.56 → 0.00 |
+
+읽는 법: Bilinear 와 SM(sm_fix) 은 closed-form 이라 전 cell fp32 floor; FrLN 은 RMSNorm(qwen·gemma·llama) 개선 / LayerNorm(gpt2) 악화; softmax 는 closed-form 이 없어 IG 로만 줄어든다.
+<!-- LAG-MIB-END -->
+
+---
+
 ## 3. 분석
 
 그림: Fig 1 `fig_lag_budget.png` (a)(b) noise budget IOI/MCQA, (c) softmax IG 수렴, (d) 태스크 효과 산점도 · Fig 2 `fig_lag_layers.png` layer 별 EAP LAG 프로파일 · Fig 3 `fig_lag_budget_arc.png`, Fig 4 `fig_lag_layers_arc.png` ARC/arithmetic 판.

@@ -124,6 +124,28 @@ def splice(txt, START, END, tables):
         pre = txt[:txt.index(START) + len(START)]; post = txt[txt.index(END):]
         return pre + '\n' + tables + '\n' + post
     return txt + '\n' + START + '\n' + tables + '\n' + END + '\n'
+
+def build_mib_table():
+    ORDER = [('gpt2','ioi'),('qwen2.5','ioi'),('gemma2','ioi'),('llama3','ioi'),('qwen2.5','mcqa'),('gemma2','mcqa'),('llama3','mcqa'),
+             ('gemma2','arc_easy'),('llama3','arc_easy'),('llama3','arc_challenge'),('llama3','arithmetic_addition'),('llama3','arithmetic_subtraction')]
+    def pair(r, op):
+        if op not in r['ops']: return '—'
+        e, m = r['ops'][op]['eap'], r['ops'][op]['mod']
+        ms = f'{m:.0e}' if m < 1e-3 else f'{m:.2f}'
+        return f'{e:.2f} → {ms}'
+    L = ['### T9. MIB 12 cell — EAP LAG → 모듈 LAG (모듈 = Bilinear · SM(sm_fix) · FrLN, softmax 는 IG Z=5)\n',
+         '각 칸 = `EAP 1차 LAG → 모듈 적용 후 LAG`. SM 은 clean↔cf chord(sm_fix, huisu `secant_cf_*`) 기준이며 출하판(원점 chord)은 `lag_smfix_report.md` 참조. Q@K 는 row-centered.\n',
+         '| cell | Q@K-c → Bilinear | A@V → Bilinear | gate·up → Bilinear | MLP act → SM | norm → FrLN | softmax → IG(Z=5) |',
+         '|---|---|---|---|---|---|---|']
+    for m, t in ORDER:
+        r = R.get((m, t))
+        if r is None: continue
+        sm = r['ops']['softmax']; ig5 = sm['ig']['5']
+        L.append(f"| {m}/{SHORT[t]} | {pair(r,'QKc')} | {pair(r,'AV')} | {pair(r,'gateup')} | {pair(r,'act')} | {pair(r,'norm')} | {sm['eap']:.2f} → {ig5:.2f} |")
+    L.append('')
+    L.append('읽는 법: Bilinear 와 SM(sm_fix) 은 closed-form 이라 전 cell fp32 floor; FrLN 은 RMSNorm(qwen·gemma·llama) 개선 / LayerNorm(gpt2) 악화; softmax 는 closed-form 이 없어 IG 로만 줄어든다.')
+    return '\n'.join(L)
+
 def build_summary():
     ALL = sum(GROUPS.values(), [])
     L = ['### T8. cross-task summary — pooled EAP LAG, min–max over the 4 models (softcap: gemma2 only)\n',
@@ -164,6 +186,7 @@ def build_summary():
 
 txt = open(REPORT).read() if os.path.exists(REPORT) else '# LAG report\n'
 txt = splice(txt, '<!-- LAG-SUMMARY-START -->', '<!-- LAG-SUMMARY-END -->', build_summary())
+txt = splice(txt, '<!-- LAG-MIB-START -->', '<!-- LAG-MIB-END -->', build_mib_table())
 for g, TASKS in GROUPS.items():
     gtag = '' if g == 'MAIN' else f'-{g}'
     if not any((m, t) in R for m in MODELS for t in TASKS): continue
