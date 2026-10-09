@@ -1,0 +1,42 @@
+{
+ "model": "gpt2",
+ "task": "ioi",
+ "n": 100,
+ "k0_over_rest_sq": 0.1995974173466946,
+ "ops": {
+  "QK": {
+   "all": {
+    "eap_lag": 0.6591206204434836,
+    "share_true_sq": 1.0,
+    "share_clean_sq": 1.0
+   },
+   "col0": {
+    "eap_lag": 1.920829635231193e-06,
+    "share_true_sq": 0.005338721197599953,
+    "share_clean_sq": 0.04045233094590671
+   },
+   "rest": {
+    "eap_lag": 0.6608871276773277,
+    "share_true_sq": 0.9946612794232185,
+    "share_clean_sq": 0.9595476686185042
+   }
+  },
+  "softmax": {
+   "all": {
+    "eap_lag": 1.4591843943631013,
+    "share_true_sq": 1.0,
+    "share_clean_sq": 1.0
+   },
+   "col0": {
+    "eap_lag": 1.4812276221233114,
+    "share_true_sq": 0.15803400016575714,
+    "share_clean_sq": 0.842638786611571
+   },
+   "rest": {
+    "eap_lag": 1.455009739945289,
+    "share_true_sq": 0.84196599570379,
+    "share_clean_sq": 0.15736121117944832
+   }
+  }
+ }
+}

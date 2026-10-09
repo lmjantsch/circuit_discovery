@@ -344,6 +344,8 @@ EAP score 에 가해지는 보정이다 (midpoint/secant = 경로 평균 Jacobia
 
 ## 3. 결과 테이블
 
+> **확장 (2026-09-10)**: 이 op-gap 지표를 **LAG (Local Approximation Gap)** 로 명명하고 4 모델(gpt2 · qwen2.5 · gemma2 · llama3) × 2 태스크(IOI · MCQA)로 확장한 결과는 `lag_report.md` 참조 (통합 스크립트 `scripts/lag_opgap.py`, 아래 §3.1–3.4 수치를 그대로 재현함).
+
 ### 3.1 GPT-2 small / IOI (100 examples)
 
 | op | 모듈 | EAP op-gap | 모듈 op-gap |
