@@ -12,7 +12,7 @@ MIB = {('gpt2','ioi'),('qwen2.5','ioi'),('gemma2','ioi'),('llama3','ioi'),('qwen
        ('gemma2','arc_easy'),('llama3','arc_easy'),('llama3','arc_challenge'),('llama3','arithmetic_addition'),('llama3','arithmetic_subtraction')}
 def tag(m, t): return '' if (m, t) in MIB else '†'
 SHORT = {'ioi': 'ioi', 'mcqa': 'mcqa', 'arc_easy': 'arcE', 'arc_challenge': 'arcC', 'arithmetic_addition': 'arith+', 'arithmetic_subtraction': 'arith−'}
-OPS = [('softmax', 'softmax', 'IG (Z×)'), ('QK', 'Q@K', 'midpoint'), ('QKc', 'Q@K row-centered', 'midpoint'), ('act', 'MLP act', 'secant'),
+OPS = [('softmax', 'softmax', 'IG (Z×)'), ('QK', 'Q@K', 'midpoint'), ('QKc', 'Q@K row-centered', 'midpoint'), ('act', 'MLP act', 'secant_cf (sm_fix)'), ('act_origin', 'MLP act — shipped +SM', 'origin f(x)/x'),
        ('gateup', 'gate·up', 'midpoint'), ('AV', 'A@V', 'midpoint'), ('norm', 'norm', 'freeze'),
        ('softcap', 'softcap', 'secant')]
 ARCH_ACT = {'gpt2': 'gelu_new', 'qwen2.5': 'SiLU', 'gemma2': 'gelu_tanh', 'llama3': 'SiLU'}

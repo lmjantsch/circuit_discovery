@@ -16,7 +16,8 @@ Ops per model
   softmax  multi-D    IG(Z)      input = scaled (softcapped for gemma) attn logits
   softcap  elemwise   secant     gemma2 only
   A@V      bilinear   midpoint
-  act      elemwise   secant     gelu_new (gpt2) / gelu_tanh (gemma2) / silu (qwen, llama)
+  act      elemwise   secant_cf  gelu_new (gpt2) / gelu_tanh (gemma2) / silu (qwen, llama)  (clean->cf chord = sm_fix)
+  act_orig elemwise   origin     same op, shipped +SM chord f(x)/x (secant_silu / secant_gelu_tanh)
   gate*up  bilinear   midpoint   gated MLP only (qwen/gemma/llama)
   norm     multi-D    freeze     LayerNorm (gpt2) / RMSNorm (others; gemma uses (1+w))
 
@@ -160,7 +161,7 @@ def jvp_softmax(s, ds, m):
     A = torch.softmax(s + m, dim=-1); return A * (ds - (A * ds).sum(-1, keepdim=True))
 
 # ---------------------------------------------------------------- accumulators (per layer; index NL = final norm)
-OPS = ['QK', 'QKc', 'softmax', 'softcap', 'AV', 'act', 'gateup', 'norm']
+OPS = ['QK', 'QKc', 'softmax', 'softcap', 'AV', 'act', 'act_origin', 'gateup', 'norm']
 qk_stats = {k: 0.0 for k in ['dq', 'q', 'dk', 'k']}
 acc = {op: {k: [0.0] * (NL + 1) for k in ['eap', 'mod', 'true', 'clean']} for op in OPS}
 accZ = {z: [0.0] * NL for z in ZS}
@@ -215,6 +216,11 @@ with torch.no_grad():
             g = cl[f'g{L}']; gs = co[f'g{L}']; dg = gs - g
             a_true = act(gs) - act(g); a_first = act_prime(g) * dg
             add('act', L, a_first, torch.where(dg.abs() > 1e-6, a_true, a_first), a_true, act(g))
+            # --- shipped +SM module (secant_silu / secant_gelu_tanh on huisu): chord from the ORIGIN, c = f(g)/g,
+            #     i.e. SiLU -> sigmoid(g), GELU-tanh -> 0.5(1+tanh(.)). Exact only for zero ablation; under
+            #     counterfactual patching the exact coefficient is the clean->cf chord ('act' above = secant_cf_*). ---
+            c_origin = torch.where(g.abs() > 1e-6, act(g) / torch.where(g.abs() > 1e-6, g, torch.ones_like(g)), act_prime(g))
+            add('act_origin', L, a_first, c_origin * dg, a_true, act(g))
             # --- gated MLP bilinear: x = act(gate), y = up ---
             if not IS_GPT2:
                 x, xs = act(g), act(gs); y, ys = cl[f'u{L}'], co[f'u{L}']; dx = xs - x; dy = ys - y
@@ -232,7 +238,7 @@ print(f'aligned examples: {n}/{len(ds)} (skipped {skipped})  ({elapsed:.0f}s)')
 # ---------------------------------------------------------------- summarize
 def ratio(num, den): return math.sqrt(num / den) if den > 0 else float('nan')
 rows = []
-MODNAME = {'QK': 'Bilinear(mid)', 'QKc': 'Bilinear(mid)', 'AV': 'Bilinear(mid)', 'gateup': 'Bilinear(mid)', 'act': 'SM(secant)',
+MODNAME = {'QK': 'Bilinear(mid)', 'QKc': 'Bilinear(mid)', 'AV': 'Bilinear(mid)', 'gateup': 'Bilinear(mid)', 'act': 'SM(secant_cf)', 'act_origin': 'SM(origin f/x)',
            'softcap': 'secant', 'norm': 'FrLN(freeze)', 'softmax': 'IG(Z)'}
 summary = {}
 for op in OPS:
